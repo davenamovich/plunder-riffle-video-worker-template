@@ -928,6 +928,7 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
         // conversation (the actual ad) ΓÇö not just the slideshow ΓÇö and the
         // last slideshow beat + CTA land on the right frames (the +1 is
         // the link card).
+        const msgs = document.querySelectorAll(".msg-row");
         const hybridMsgCount = Number((window as any).__hybridMsgCount || 0);
         const vesselBeats = Math.max(beats.length, dataBeats.length);
         return {
@@ -938,6 +939,7 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
             confessions.length,
             reports.length,
             slides.length,
+            msgs.length,
           ),
           vesselBeatCount: vesselBeats + hybridMsgCount + (hybridMsgCount > 0 ? 1 : 0),
           beatMs: Number(vessel.beatMs) || 0,
@@ -946,6 +948,7 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
           hasLanding: vesselHook.hasLanding === true,
           audioSrc: audioSrc || null,
           audioDurationSec,
+          isImessage: msgs.length > 0,
         };
       })
       .catch(() => ({
@@ -957,13 +960,14 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
         hasLanding: false,
         audioSrc: null as string | null,
         audioDurationSec: 0,
+        isImessage: false,
       }));
 
     const beatMs = pageInfo.beatMs || DEFAULT_BEAT_MS;
     const audioPath = await resolveAudioForMix(opts.songUrl, pageInfo.audioSrc, opts.url, id);
 
     // ΓöÇΓöÇ HIGH-FIDELITY VESSEL PATH ΓöÇΓöÇ
-    if (pageInfo.hasVesselHook && pageInfo.vesselBeatCount >= 1) {
+    if (pageInfo.hasVesselHook && pageInfo.vesselBeatCount >= 1 && !pageInfo.isImessage) {
       console.log(`[recorder] Vessel path ΓÇö ${pageInfo.vesselBeatCount} beats (${beatMs}ms)`);
       await page.close().catch(() => {});
       await context.close().catch(() => {});
