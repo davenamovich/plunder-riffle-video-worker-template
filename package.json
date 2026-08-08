@@ -1,0 +1,25 @@
+{
+  "name": "video-worker",
+  "version": "1.0.0",
+  "description": "Standalone MP4 Video Worker for meme-loop-engine",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "ts-node server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "engines": {
+    "node": ">=20 <21"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "playwright-core": "1.62.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "ts-node": "^10.9.1",
+    "@types/node": "^20.0.0",
+    "@types/express": "^4.17.21"
+  }
+}

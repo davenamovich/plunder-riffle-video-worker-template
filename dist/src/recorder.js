@@ -1,0 +1,1357 @@
+"use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.getRecordingStatus = exports.listJobs = exports.getJob = void 0;
+exports.startRecordingJob = startRecordingJob;
+exports.recorderDiagnostics = recorderDiagnostics;
+exports.deleteJob = deleteJob;
+exports.retainRecording = retainRecording;
+exports.deleteOldRecordings = deleteOldRecordings;
+/**
+ * here.now ΓåÆ MP4 Recorder ΓÇö Core engine
+ *
+ * Records any live web page as a vertical 9:16 MP4 using Playwright + FFmpeg.
+ * Ported and adapted from plunder's url-recorder so the output matches what
+ * the plunder bot ships (blur-background phone canvas, crisp per-beat frames,
+ * correct per-format duration, page-audio mix, thumbnail, encode health check).
+ *
+ * Two recording paths:
+ *
+ * 1. HIGH-FIDELITY VESSEL PATH ΓÇö when the target page exposes
+ *    `window.__vessel = { ready: true, setBeat(n) }` (slideshow / confession /
+ *    imessage builders ship this hook). The recorder drives the page beat by
+ *    beat (n = -1 hero frame, 0..beatCount-1 beats, beatCount = CTA),
+ *    screenshots each state supersampled (deviceScaleFactor 2), then FFmpeg
+ *    assembles Ken Burns + crossfade frames into a phone-sized video, which is
+ *    composited onto a blurred 1080├ù1920 canvas. No screencast = no dropped
+ *    frames, no 390pxΓåÆ1080px upscale blur.
+ *
+ * 2. SCREENCAST PATH ΓÇö pages without the hook (blog posts, hot-take,
+ *    news-ticker, ranked-list, before/after, fake-dm, audio-letter, or any
+ *    arbitrary URL). Playwright recordVideo captures a webm while the page
+ *    auto-plays; duration comes from the page's VESSEL declaration
+ *    (beatMs ├ù beats) or the beat count; scrollable pages are scrolled at a
+ *    comfortable pace with intro/outro holds and idle detection (matches
+ *    plunder's closed-loop timing). The webm is trimmed to the show and
+ *    composited onto the same blurred canvas.
+ *
+ * Both paths:
+ *   - mix in the page's own <audio> track (bgm / bedSrc / any <audio>)
+ *   - emit a thumbnail JPEG
+ *   - sniff the finished MP4 for a moov/ftyp box so a truncated encode fails
+ *     loud instead of reporting "done" with an unplayable file
+ *   - clean up interim webm/audio files
+ *
+ * Key design decisions:
+ *   - Never use ffmpeg-static: install system ffmpeg or set FFMPEG_PATH
+ *   - Lazy-import playwright-core so the module loads when it's not installed
+ *   - globalThis job registry survives hot reloads
+ */
+const child_process_1 = require("child_process");
+const promises_1 = require("fs/promises");
+const fs_1 = require("fs");
+const os_1 = require("os");
+const path_1 = require("path");
+const crypto_1 = require("crypto");
+// ΓöÇΓöÇ Constants ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+const RECORDINGS_DIR = (0, path_1.join)(process.cwd(), "download", "recordings");
+const VIEWPORTS = {
+    // Exactly 9:16 (432/768 = 0.5625). Recording the page at the SAME aspect as
+    // the output means the finished video is edge-to-edge page instead of a
+    // narrow phone screenshot floating in blurred filler.
+    vertical: { width: 432, height: 768, name: "Vertical 9:16" },
+    iphone14: { width: 390, height: 844, name: "iPhone 14" },
+    "iphone-se": { width: 375, height: 667, name: "iPhone SE" },
+    "pixel-7": { width: 412, height: 915, name: "Pixel 7" },
+    "galaxy-s22": { width: 360, height: 780, name: "Galaxy S22" },
+};
+const VERTICAL_OUT_W = 1080;
+const VERTICAL_OUT_H = 1920; // 9:16 vertical
+const FPS = 30;
+const TRANSITION_SEC = 0.4; // crossfade between beats
+const SUPERSAMPLE = 2; // per-beat PNG deviceScaleFactor (crisp upscale)
+// Closed-loop ("scroll drives length") timing ΓÇö ported from plunder.
+const SCROLL_PX_PER_SEC = 240;
+const INTRO_HOLD_MS = 1000;
+const OUTRO_HOLD_MS = 1000;
+/**
+ * Extra trim taken PAST the show-start mark, on top of the blank lead.
+ *
+ * This was previously SUBTRACTED from showStartMs, which rewound the cut a full
+ * second BEFORE the show began and pulled the white navigation frames it was
+ * named for straight back into the video — the cause of the white opening
+ * second, and therefore of the white poster frame. It is now added, which is
+ * what the name always claimed it did.
+ */
+const WHITE_GUARD_MS = 1500;
+/**
+ * How long the first clean frame is held before the show starts moving.
+ *
+ * Platforms sample the poster frame from the very start of the file, so the
+ * opening frame has to be both clean AND still long enough to be picked up.
+ * Cloned with ffmpeg `tpad`, so it costs no extra recording time.
+ *
+ * This was set to 0 in commit 5c32f80 because turning it on (900ms) didn't
+ * remove the white flash — it made it worse. The reason: the frame `tpad`
+ * clones is whatever sits at `leadSec`, and `leadSec` used to be picked by a
+ * JS-timer guess (page readyState + a fixed guard band) with no check that the
+ * frame there was actually painted. If the page reported "ready" before it
+ * finished rendering, the cloned frame was still blank — so holding it just
+ * held the white for longer. `leadSec` is now verified against the actual
+ * pixels first (see `findCleanTrimSec`), so the hold is safe to re-enable.
+ */
+const HOLD_FIRST_FRAME_MS = 4500;
+const POST_ROLL_MS = 2200; // cut 2s from end to remove white — small tail kept after the show when trimming
+const AUTO_LEN_CAP_MS = 180_000;
+const DEFAULT_BEAT_MS = 5250; // FIXED: 5.25s per slide for all formats
+// ΓöÇΓöÇ In-memory job registry ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// Stored on globalThis so it survives Node.js module hot reloads in dev.
+const globalAny = globalThis;
+if (!globalAny.__RALPH_RECORD_JOBS__)
+    globalAny.__RALPH_RECORD_JOBS__ = new Map();
+const jobs = globalAny.__RALPH_RECORD_JOBS__;
+// ΓöÇΓöÇ FFmpeg resolution ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// DO NOT bundle ffmpeg-static ΓÇö the binary path breaks in production builds.
+// Install system-wide: `apt-get install ffmpeg` (Railway/Docker)
+// or set the FFMPEG_PATH env var.
+function resolveFfmpeg() {
+    const ffmpegPath = process.env["FFMPEG_PATH"];
+    if (ffmpegPath)
+        return ffmpegPath;
+    for (const p of ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"]) {
+        if ((0, fs_1.existsSync)(p))
+            return p;
+    }
+    return "ffmpeg"; // trust PATH
+}
+// ΓöÇΓöÇ FFmpeg runner ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+/**
+ * Hard ceiling on a single FFmpeg invocation.
+ *
+ * Renders are serialised (MAX_CONCURRENT_JOBS = 1), so an FFmpeg that never
+ * exits does not just lose one video — it holds the only render slot forever
+ * and every later MP4 sits at "waiting in queue" until the process restarts.
+ * Kill it instead. Override with RECORD_FFMPEG_TIMEOUT_MS.
+ */
+function ffmpegTimeoutMs() {
+    const raw = Number(process.env["RECORD_FFMPEG_TIMEOUT_MS"]);
+    return Number.isFinite(raw) && raw > 0 ? raw : 300_000;
+}
+function runFfmpeg(args) {
+    return new Promise((resolve, reject) => {
+        const ffmpeg = (0, child_process_1.spawn)(resolveFfmpeg(), args, {
+            stdio: ["ignore", "pipe", "pipe"],
+            shell: process.platform === "win32",
+        });
+        const limitMs = ffmpegTimeoutMs();
+        let timedOut = false;
+        const killer = setTimeout(() => {
+            timedOut = true;
+            ffmpeg.kill("SIGKILL");
+        }, limitMs);
+        if (killer.unref)
+            killer.unref();
+        const stderrChunks = [];
+        ffmpeg.stderr.on("data", (d) => {
+            stderrChunks.push(d);
+            if (stderrChunks.length > 300)
+                stderrChunks.shift();
+        });
+        ffmpeg.on("close", (code) => {
+            clearTimeout(killer);
+            if (timedOut) {
+                return reject(new Error(`FFmpeg killed after ${Math.round(limitMs / 1000)}s (timeout)`));
+            }
+            if (code === 0)
+                return resolve();
+            const stderr = Buffer.concat(stderrChunks).toString().slice(-3000);
+            reject(new Error(`FFmpeg exited ${code}: ${stderr}`));
+        });
+        ffmpeg.on("error", (e) => {
+            clearTimeout(killer);
+            reject(e);
+        });
+    });
+}
+async function fileExists(p) {
+    try {
+        await (0, promises_1.stat)(p);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * Post-encode validity check (ported from plunder's url-recorder): ffmpeg's
+ * `-movflags +faststart` rewrites the moov box to the front of the file; if
+ * that pass is interrupted the mp4 ends up with the stream but NO moov atom ΓÇö
+ * ffprobe reports "0 duration / unplayable" even though ffmpeg exited 0. Sniff
+ * the first chunk for "moov" (and "ftyp" sanity) so we fail loud instead of
+ * shipping a corrupt file.
+ */
+async function assertMp4Healthy(p) {
+    const s = await (0, promises_1.stat)(p);
+    if (s.size === 0)
+        throw new Error("FFmpeg produced an empty MP4");
+    const SNIFF = Math.min(s.size, 4 * 1024 * 1024);
+    const fh = await (0, promises_1.open)(p, "r");
+    try {
+        const buf = Buffer.alloc(SNIFF);
+        await fh.read(buf, 0, SNIFF, 0);
+        const hasMoov = buf.indexOf(Buffer.from("moov", "ascii")) >= 0;
+        const hasFtyp = buf.indexOf(Buffer.from("ftyp", "ascii")) >= 0;
+        if (!hasMoov || !hasFtyp) {
+            throw new Error(`ffmpeg wrote a non-MP4 file at ${p} (${s.size} bytes; moov=${hasMoov} ftyp=${hasFtyp}). Check the filter graph for malformed filters.`);
+        }
+    }
+    finally {
+        await fh.close();
+    }
+}
+// ΓöÇΓöÇ Blur-background 9:16 composite ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// The phone-sized recording is scaled to a 160px-margin center column on a
+// 1080├ù1920 canvas whose background is a blurred, darkened zoom of the video
+// itself (matches plunder's default `background: blur` look).
+/**
+ * True when the recorded page is already the output aspect, so it can fill the
+ * canvas edge-to-edge instead of being letterboxed into blurred filler.
+ *
+ * Recording at 390x844 (iPhone 14) and fitting that into 1080x1920 leaves the
+ * page covering only ~57% of the frame, with the other ~43% blurred bars. A
+ * 9:16 source covers 100%.
+ */
+function fillsOutputAspect(phoneW, phoneH) {
+    const target = VERTICAL_OUT_W / VERTICAL_OUT_H;
+    return Math.abs(phoneW / phoneH - target) < 0.01;
+}
+/**
+ * Where the phone screen sits inside the 1080x1920 canvas. Shared by the
+ * composite filter and the thumbnail's blank-frame check, which has to measure
+ * the page pixels rather than the whole canvas.
+ */
+function phoneRect(phoneW, phoneH) {
+    const margin = 160;
+    const targetH = VERTICAL_OUT_H - margin * 2;
+    const scaledWBase = Math.round((targetH * phoneW) / phoneH);
+    const scaledW = scaledWBase % 2 === 0 ? scaledWBase : scaledWBase + 1;
+    const x = Math.round((VERTICAL_OUT_W - scaledW) / 2);
+    return { margin, targetH, scaledW, x };
+}
+/**
+ * ffmpeg crop expression isolating the page pixels in the finished MP4.
+ * Undefined when the page already fills the frame — there is nothing to crop
+ * away, and the whole frame IS the page.
+ */
+function phoneCropFilter(phoneW, phoneH) {
+    if (fillsOutputAspect(phoneW, phoneH))
+        return undefined;
+    const { margin, targetH, scaledW, x } = phoneRect(phoneW, phoneH);
+    return `crop=${scaledW}:${targetH}:${x}:${margin}`;
+}
+/**
+ * @param holdSec When > 0, clone the first frame for this long before the show
+ *   moves, and skip the fade-up. Used by the screencast path so the poster
+ *   frame is a solid, fully-lit hero rather than a black-to-hero blend.
+ *   The frames/slideshow path passes 0 and keeps its original fade.
+ */
+function buildCompositeFilter(background, phoneW, phoneH, holdSec = 0, trimSec = 0) {
+    const chains = [];
+    const trim = trimSec > 0 ? `trim=start=${trimSec.toFixed(3)},setpts=PTS-STARTPTS,` : "";
+    // tpad clones the FIRST frame of the (already trimmed) input, so the hold is
+    // built from the clean hero rather than from whatever preceded it.
+    const hold = holdSec > 0 ? `tpad=start_duration=${holdSec.toFixed(3)}:start_mode=clone,` : "";
+    // ── Full-bleed path ──
+    // When the page was recorded at the output aspect there is nothing to letterbox:
+    // scale to cover and crop off the rounding, so the video is 100% page. The
+    // blurred-bezel treatment below only exists to fill space a non-9:16 source
+    // leaves behind, and running it on a 9:16 source would shrink the page for
+    // no reason.
+    if (fillsOutputAspect(phoneW, phoneH)) {
+        const tail = holdSec > 0 ? "" : ",fade=t=in:st=0:d=0.2";
+        chains.push(`[0:v]${trim}${hold}scale=${VERTICAL_OUT_W}:${VERTICAL_OUT_H}:force_original_aspect_ratio=increase,` +
+            `crop=${VERTICAL_OUT_W}:${VERTICAL_OUT_H},setsar=1${tail}[out]`);
+        return chains.join(";");
+    }
+    chains.push(`[0:v]${trim}${hold}scale=${phoneW}:${phoneH}:force_original_aspect_ratio=decrease,pad=${phoneW}:${phoneH}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[screen]`);
+    // A fade-up from black is exactly what ruins a poster frame, so it is only
+    // applied when we are NOT holding the opening frame for the thumbnail.
+    const finish = holdSec > 0 ? `[ovr]null[out]` : `[ovr]fade=t=in:st=0:d=0.2[out]`;
+    const { margin, targetH, scaledW, x } = phoneRect(phoneW, phoneH);
+    if (background === "blur") {
+        chains.push("[screen]split=2[src_bg][src_fg]");
+        chains.push(`[src_bg]scale=${VERTICAL_OUT_W}:${VERTICAL_OUT_H}:force_original_aspect_ratio=increase,crop=${VERTICAL_OUT_W}:${VERTICAL_OUT_H},gblur=sigma=40,eq=brightness=-0.3[bg]`);
+        chains.push(`[src_fg]scale=${scaledW}:${targetH},setsar=1[fg]`);
+        chains.push(`[bg][fg]overlay=${x}:${margin}:format=auto[ovr]`);
+        chains.push(finish);
+    }
+    else if (background === "gradient") {
+        chains.push(`color=c=0x1a1a2e:s=${VERTICAL_OUT_W}x${VERTICAL_OUT_H}[gradbase]`);
+        chains.push(`[gradbase]geq=r='r(X,Y)*(1-(Y/H)*0.6)':g='g(X,Y)*(1-(Y/H)*0.6)':b='b(X,Y)*(1-(Y/H)*0.6)+30'[bg]`);
+        chains.push(`[screen]scale=${scaledW}:${targetH},setsar=1[fg]`);
+        chains.push(`[bg][fg]overlay=${x}:${margin}:format=auto[ovr]`);
+        chains.push(finish);
+    }
+    else {
+        chains.push(`color=c=0x000000:s=${VERTICAL_OUT_W}x${VERTICAL_OUT_H}[bg]`);
+        chains.push(`[screen]scale=${scaledW}:${targetH},setsar=1[fg]`);
+        chains.push(`[bg][fg]overlay=${x}:${margin}:format=auto[ovr]`);
+        chains.push(finish);
+    }
+    return chains.join(";");
+}
+/** Run ffmpeg and return whatever it wrote to stdout. */
+function runFfmpegCapture(args) {
+    return new Promise((resolve, reject) => {
+        const ffmpeg = (0, child_process_1.spawn)(resolveFfmpeg(), args, {
+            stdio: ["ignore", "pipe", "pipe"],
+            shell: process.platform === "win32",
+        });
+        const limitMs = ffmpegTimeoutMs();
+        let timedOut = false;
+        const killer = setTimeout(() => {
+            timedOut = true;
+            ffmpeg.kill("SIGKILL");
+        }, limitMs);
+        if (killer.unref)
+            killer.unref();
+        const out = [];
+        const errChunks = [];
+        ffmpeg.stdout.on("data", (d) => out.push(d));
+        ffmpeg.stderr.on("data", (d) => {
+            errChunks.push(d);
+            if (errChunks.length > 100)
+                errChunks.shift();
+        });
+        ffmpeg.on("close", (code) => {
+            clearTimeout(killer);
+            if (timedOut) {
+                return reject(new Error(`FFmpeg killed after ${Math.round(limitMs / 1000)}s (timeout)`));
+            }
+            if (code === 0)
+                return resolve(Buffer.concat(out));
+            reject(new Error(`FFmpeg exited ${code}: ${Buffer.concat(errChunks).toString().slice(-1500)}`));
+        });
+        ffmpeg.on("error", (e) => {
+            clearTimeout(killer);
+            reject(e);
+        });
+    });
+}
+/**
+ * A frame counts as blank only when it is BOTH very bright AND almost
+ * completely flat.
+ *
+ * Brightness alone is not enough, and assuming it was is how a naive check
+ * would break real pages: measured on the composited canvas, a genuine blank
+ * lead reads mean 255 / sd 0, while a perfectly good white-background page
+ * with text reads mean 216 / sd 63. Testing brightness on its own would throw
+ * away the second one. The flatness test is what separates them.
+ */
+const BLANK_MEAN_MIN = 235;
+const BLANK_SD_MAX = 6;
+/**
+ * Mean + standard deviation of the frame at `atSec`, measured over the PHONE
+ * SCREEN only.
+ *
+ * Cropping first matters: measured across the whole 1080x1920 canvas even a
+ * blank frame shows sd ~37, purely from the edge between the phone rect and
+ * the blurred bezel, which masks the flatness we're looking for. Cropping to
+ * the page pixels takes that blank frame to sd 0.
+ */
+async function frameStats(mp4Path, atSec, crop) {
+    try {
+        // Decode ONE frame down to 8x8 greyscale raw bytes — 64 values to measure.
+        const raw = await runFfmpegCapture([
+            "-v",
+            "error",
+            "-ss",
+            atSec.toFixed(3),
+            "-i",
+            mp4Path,
+            "-vframes",
+            "1",
+            "-vf",
+            crop ? `${crop},scale=8:8` : "scale=8:8",
+            "-pix_fmt",
+            "gray",
+            "-f",
+            "rawvideo",
+            "-",
+        ]);
+        if (raw.length === 0)
+            return null;
+        let sum = 0;
+        for (const b of raw)
+            sum += b;
+        const mean = sum / raw.length;
+        let varSum = 0;
+        for (const b of raw)
+            varSum += (b - mean) ** 2;
+        return { mean, sd: Math.sqrt(varSum / raw.length) };
+    }
+    catch {
+        return null;
+    }
+}
+function isBlankFrame(s) {
+    return s.mean >= BLANK_MEAN_MIN && s.sd <= BLANK_SD_MAX;
+}
+/**
+ * Finds a lead-trim point at/after `baseSec` whose frame is not blank, scanned
+ * on the RAW webm before compositing (no crop needed — at that stage the whole
+ * frame is already just the page, there's no blurred bezel around it yet).
+ *
+ * This is the frame `HOLD_FIRST_FRAME_MS` clones via `tpad`, so if this lands
+ * on white, the hold just holds the white for longer instead of fixing it —
+ * that's exactly what happened before this existed (see the note on
+ * `HOLD_FIRST_FRAME_MS`). Reuses the same mean/sd blank test as the thumbnail
+ * picker below, just applied to picking the video's own frame 0 instead of a
+ * separate JPEG.
+ *
+ * Falls back to `baseSec` unmoved if every candidate reads as blank (or is
+ * unreadable) — better to ship the original timer-based guess than trim away
+ * real show content searching for a frame that was never going to show up.
+ */
+async function findCleanTrimSec(rawPath, baseSec, ceilingSec) {
+    const offsets = [0, 0.3, 0.6, 1.0, 1.5, 2.5];
+    for (const off of offsets) {
+        const t = baseSec + off;
+        if (t >= ceilingSec)
+            break;
+        const s = await frameStats(rawPath, t, undefined);
+        if (s === null)
+            continue;
+        if (!isBlankFrame(s))
+            return t;
+        console.warn(`[recorder] lead-trim candidate at ${t.toFixed(2)}s is blank ` +
+            `(mean ${s.mean.toFixed(0)}, sd ${s.sd.toFixed(1)}) — trying later`);
+    }
+    return baseSec;
+}
+/**
+ * Generate the poster frame from the finished MP4.
+ *
+ * The timestamp alone is not trustworthy: a slow-painting page, a stalled font
+ * load, or any regression in the lead-trim maths puts a white frame exactly
+ * where the thumbnail is sampled — which is what shipped white thumbnails to
+ * Telegram and YouTube. So each candidate is decoded and its brightness
+ * checked, and near-white frames are rejected in favour of a later one.
+ *
+ * Returns the path, or undefined when it fails — a missing thumbnail never
+ * fails the job.
+ */
+async function makeThumbnail(mp4Path, thumbPath, preferSec = 0.45, crop) {
+    // Preferred moment first, then progressively deeper into the show.
+    const candidates = [preferSec, preferSec + 0.5, 1.5, 2.5, 4, 6];
+    let fallback = null;
+    for (const t of candidates) {
+        const s = await frameStats(mp4Path, t, crop);
+        if (s === null)
+            continue;
+        if (fallback === null)
+            fallback = t;
+        if (isBlankFrame(s)) {
+            console.warn(`[recorder] thumbnail candidate at ${t}s is blank ` +
+                `(mean ${s.mean.toFixed(0)}, sd ${s.sd.toFixed(1)}) — trying later`);
+            continue;
+        }
+        try {
+            await runFfmpeg(["-y", "-ss", t.toFixed(3), "-i", mp4Path, "-vframes", "1", "-q:v", "2", thumbPath]);
+            if (await fileExists(thumbPath))
+                return thumbPath;
+        }
+        catch (e) {
+            console.warn("[recorder] thumbnail write failed:", e.message);
+        }
+    }
+    // Every candidate read as blank (or none were readable). Still emit something
+    // rather than shipping no thumbnail at all.
+    try {
+        await runFfmpeg([
+            "-y",
+            "-ss",
+            (fallback ?? preferSec).toFixed(3),
+            "-i",
+            mp4Path,
+            "-vframes",
+            "1",
+            "-q:v",
+            "2",
+            thumbPath,
+        ]);
+        if (await fileExists(thumbPath))
+            return thumbPath;
+    }
+    catch (e) {
+        console.warn("[recorder] thumbnail failed:", e.message);
+    }
+    return undefined;
+}
+/**
+ * Resolve an audio file to mix into the MP4: opts.songUrl > the page's own
+ * detected audio (bgm / bedSrc / any <audio src>). Returns a local path or null.
+ */
+async function resolveAudioForMix(songUrl, pageAudioSrc, pageUrl, id) {
+    const src = songUrl || pageAudioSrc;
+    if (!src)
+        return null;
+    try {
+        if (src.startsWith("data:audio/")) {
+            const m = /^data:audio\/([\w.+-]+);base64,(.+)$/.exec(src);
+            if (!m)
+                return null;
+            const ext = m[1] === "mpeg" ? "mp3" : m[1].split(".")[0] || "mp3";
+            const target = (0, path_1.join)((0, os_1.tmpdir)(), `rec-audio-${id}.${ext}`);
+            await (0, promises_1.writeFile)(target, Buffer.from(m[2], "base64"));
+            return target;
+        }
+        const abs = new URL(src, pageUrl).toString();
+        const res = await fetch(abs);
+        if (!res.ok)
+            return null;
+        const buf = Buffer.from(await res.arrayBuffer());
+        if (buf.length === 0)
+            return null;
+        const extMatch = /\.([a-z0-9]+)(?:$|\?)/i.exec(abs);
+        const ext = extMatch ? extMatch[1].toLowerCase() : "mp3";
+        const target = (0, path_1.join)((0, os_1.tmpdir)(), `rec-audio-${id}.${ext}`);
+        await (0, promises_1.writeFile)(target, buf);
+        return target;
+    }
+    catch (e) {
+        console.warn("[recorder] audio fetch failed ΓÇö MP4 will be silent:", e.message);
+        return null;
+    }
+}
+// ΓöÇΓöÇ Per-beat capture (HIGH-FIDELITY vessel path) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// Drives the page's `__vessel.setBeat(n)` contract:
+//   n === -1        ΓåÆ hero / landing frame (when hasLanding)
+//   0..beatCount-1  ΓåÆ beat n
+//   n === beatCount ΓåÆ CTA screen
+// Screenshots each state supersampled so the final upscale stays crisp.
+async function captureVesselFrames(browser, pageUrl, opts, beatCount, hasLanding, dir) {
+    const vp = VIEWPORTS[opts.viewport || "vertical"];
+    const W = vp.width;
+    const H = vp.height;
+    const { devices } = await Promise.resolve().then(() => __importStar(require("playwright-core")));
+    const ctx = await browser.newContext({
+        ...devices["iPhone 14"],
+        viewport: { width: W, height: H },
+        deviceScaleFactor: SUPERSAMPLE,
+        reducedMotion: "reduce",
+    });
+    const page = await ctx.newPage();
+    const url = new URL(pageUrl);
+    url.searchParams.set("mode", "frame");
+    try {
+        await page.goto(url.toString(), { waitUntil: opts.waitUntil || "load", timeout: 30_000 });
+    }
+    catch (err) {
+        console.warn(`[recorder] vessel capture goto warning: ${err?.message ?? err}`);
+    }
+    // Never screenshot before fonts settle ΓÇö a font swap mid-capture is the #1
+    // cause of a visibly wrong frame. Then wait for the page's vessel hook.
+    // (In ?mode=frame the builders also disable entrance/reveal animations so
+    // screenshots are deterministic ΓÇö see the .frame-mode CSS in the builders.)
+    try {
+        await page.evaluate(() => document.fonts?.ready).catch(() => { });
+    }
+    catch { }
+    try {
+        await page.waitForFunction(() => window.__vessel?.ready === true, {
+            timeout: 10_000,
+        });
+    }
+    catch {
+        // No vessel.ready (old page) ΓÇö the settle wait below covers it.
+    }
+    await page.waitForTimeout(400);
+    const frames = [];
+    if (hasLanding)
+        frames.push(-1);
+    for (let i = 0; i < beatCount; i++)
+        frames.push(i);
+    frames.push(beatCount); // CTA
+    const paths = [];
+    for (let i = 0; i < frames.length; i++) {
+        const n = frames[i];
+        await page
+            .evaluate((idx) => {
+            const v = window.__vessel;
+            if (v && typeof v.setBeat === "function")
+                v.setBeat(idx);
+        }, n)
+            .catch(() => { });
+        // The first frame gets a longer settle (React rendering + entrance animations,
+        // even when disabled, need time to commit); subsequent beats need ~400ms to swap.
+        const isFirst = i === 0;
+        await page.waitForTimeout(isFirst ? 2500 : 400);
+        const name = n === -1 ? "hero" : String(n);
+        const p = (0, path_1.join)(dir, `beat-${name}.png`);
+        await page.screenshot({ path: p, type: "png" });
+        paths.push(p);
+    }
+    await ctx.close().catch(() => { });
+    return paths;
+}
+/**
+ * Assemble per-beat PNGs into a phone-sized video with Ken Burns motion per
+ * beat and crossfades between them (ported from plunder's
+ * render-transmission-video filter graph ΓÇö including the zoompan `d=1` gotcha:
+ * with `-loop 1` the input is already N frames, so `d` must be 1 and the zoom
+ * is driven by `on`, the output frame index).
+ */
+async function assembleBeatVideo(frames, beatMs, outPath, phoneW, phoneH) {
+    const n = frames.length;
+    if (n < 1)
+        throw new Error("assembleBeatVideo: need >= 1 frame");
+    const T = TRANSITION_SEC;
+    const D = Math.max(1.8, beatMs / 1000);
+    const total = n === 1 ? D : D + (n - 1) * (D - T);
+    if (total > AUTO_LEN_CAP_MS / 1000) {
+        throw new Error(`Render would be ${total.toFixed(1)}s ΓÇö slideshow caps at ${AUTO_LEN_CAP_MS / 1000}s. Reduce beats.`);
+    }
+    const args = ["-y"];
+    for (const f of frames)
+        args.push("-loop", "1", "-framerate", String(FPS), "-i", f);
+    const parts = [];
+    for (let i = 0; i < n; i++) {
+        const z = i % 2 === 0 ? "min(1+0.0009*on,1.10)" : "max(1.10-0.0009*on,1.0)";
+        parts.push(`[${i}:v]trim=duration=${D},setpts=PTS-STARTPTS,` +
+            `scale=${Math.round(phoneW * 1.1)}:${Math.round(phoneH * 1.1)}:flags=lanczos,` +
+            `zoompan=z='${z}':d=1:x='ih/2-(ih/zoom/2)':y='ih/2-(ih/zoom/2)':` +
+            `s=${phoneW}x${phoneH}:fps=${FPS},setsar=1[v${i}]`);
+    }
+    let prev = "[v0]";
+    let finalLabel = "[v0]";
+    for (let k = 1; k < n; k++) {
+        const offset = (D + (k - 1) * (D - T) - T).toFixed(3);
+        const out = k === n - 1 ? "[vout]" : `[x${k}]`;
+        parts.push(`${prev}[v${k}]xfade=transition=fade:duration=${T}:offset=${offset}${out}`);
+        prev = out;
+        finalLabel = out;
+    }
+    args.push("-filter_complex", parts.join(";"));
+    args.push("-map", finalLabel);
+    args.push("-c:v", "libx264", "-profile:v", "high", "-level", "4.0", "-preset", "medium", "-crf", "19", "-pix_fmt", "yuv420p", "-r", String(FPS), "-g", String(FPS * 2), "-movflags", "+faststart", "-t", total.toFixed(3), outPath);
+    await runFfmpeg(args);
+    return total;
+}
+// ΓöÇΓöÇ Scroll driver (screencast path) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// Ported from plunder's closed-loop timing: intro hold ΓåÆ constant-pace scroll
+// (240px/s) with idle detection ΓåÆ outro hold. Fixed-position pages (no scroll)
+// just wait out totalMs, breaking early on an explicit __vesselDone signal.
+// Serialized as a string because it must run INSIDE the page (page.evaluate).
+const SCROLL_DRIVER_SRC = `async (cfg) => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const maxScroll =
+    Math.max(document.body.scrollHeight, document.documentElement.scrollHeight) - window.innerHeight;
+  let lastFrameChangeTime = Date.now();
+
+  if (maxScroll <= 0) {
+    const startMs = Date.now();
+    while (Date.now() - startMs < cfg.totalMs) {
+      const isDone =
+        window.__vesselDone === true ||
+        window.__recordingFinished === true ||
+        window.__slideshowDone === true;
+      if (isDone) break;
+      await sleep(200);
+    }
+    return;
+  }
+
+  await sleep(cfg.introMs);
+  lastFrameChangeTime = Date.now();
+
+  if (cfg.mode === 'auto') {
+    await new Promise((resolve) => {
+      let last = performance.now();
+      let y = 0;
+      const step = () => {
+        const now = performance.now();
+        const dt = (now - last) / 1000;
+        last = now;
+        const prevY = y;
+        y = Math.min(maxScroll, y + cfg.pxPerSec * dt);
+        window.scrollTo(0, Math.round(y));
+        if (Math.round(y) !== Math.round(prevY)) lastFrameChangeTime = Date.now();
+        if (Date.now() - lastFrameChangeTime >= cfg.maxIdleMs) return resolve();
+        if (y < maxScroll) requestAnimationFrame(step);
+        else resolve();
+      };
+      requestAnimationFrame(step);
+    });
+  } else {
+    const scrollMs = Math.max(500, cfg.totalMs - cfg.introMs - cfg.outroMs);
+    await new Promise((resolve) => {
+      const start = performance.now();
+      const tick = () => {
+        const elapsed = performance.now() - start;
+        const t = Math.min(1, elapsed / scrollMs);
+        const eased = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+        window.scrollTo(0, Math.round(eased * maxScroll));
+        if (Date.now() - lastFrameChangeTime >= cfg.maxIdleMs) return resolve();
+        if (t < 1) requestAnimationFrame(tick);
+        else resolve();
+      };
+      requestAnimationFrame(tick);
+    });
+  }
+
+  const outroStart = Date.now();
+  while (Date.now() - outroStart < cfg.outroMs) {
+    if (Date.now() - lastFrameChangeTime >= cfg.maxIdleMs) break;
+    await sleep(200);
+  }
+}`;
+// ΓöÇΓöÇ Core recorder ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+async function recordPage(opts, id) {
+    // Lazy import playwright-core so the module loads fine even if the package
+    // is not installed (graceful degradation when the feature isn't available).
+    let chromium, devices;
+    try {
+        ({ chromium, devices } = await Promise.resolve().then(() => __importStar(require("playwright-core"))));
+    }
+    catch {
+        throw new Error("playwright-core is not installed. Run: npm install playwright-core");
+    }
+    await (0, promises_1.mkdir)(RECORDINGS_DIR, { recursive: true });
+    const workDir = (0, path_1.join)((0, os_1.tmpdir)(), `rec-${id}`);
+    await (0, promises_1.mkdir)(workDir, { recursive: true });
+    const mp4Path = (0, path_1.join)(RECORDINGS_DIR, `${id}.mp4`);
+    const thumbPath = (0, path_1.join)(RECORDINGS_DIR, `${id}-thumb.jpg`);
+    const viewport = VIEWPORTS[opts.viewport || "vertical"];
+    const background = opts.background || "blur";
+    const aspectRatio = opts.aspectRatio || "9:16";
+    const autoDuration = opts.autoDuration !== false;
+    const baseUrl = (process.env["PUBLIC_BASE_URL"] || "http://localhost:8080").replace(/\/$/, "");
+    const browser = await chromium.launch({
+        headless: true,
+        executablePath: process.env["PLAYWRIGHT_CHROMIUM_PATH"] || undefined,
+        args: [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--autoplay-policy=no-user-gesture-required",
+            "--font-render-hinting=none",
+        ],
+    });
+    try {
+        const context = await browser.newContext({
+            ...devices["iPhone 14"],
+            viewport: { width: viewport.width, height: viewport.height },
+            recordVideo: { dir: workDir, size: { width: viewport.width, height: viewport.height } },
+        });
+        // Stamp the clock exactly when Playwright starts the webm recording.
+        // This allows the ffmpeg trimmer to accurately slice off the page load white screen.
+        const recordClockStart = Date.now();
+        const page = await context.newPage();
+        await page
+            .goto(opts.url, { waitUntil: opts.waitUntil || "load", timeout: 30_000 })
+            .catch(() => { });
+        await page.waitForTimeout(opts.extraWaitMs ?? 400);
+        // Live media-readiness wait: never measure duration while an embedded
+        // <audio>/<video> still reads 0/NaN.
+        try {
+            await page.waitForFunction(() => {
+                const all = Array.from(document.querySelectorAll("audio, video"));
+                if (all.length === 0)
+                    return true;
+                return all.every((m) => m.readyState >= 1 && m.duration > 0 && isFinite(m.duration));
+            }, { timeout: 2500, polling: 100 });
+        }
+        catch { }
+        // Detect beats, per-format VESSEL timing, vessel hook and page audio.
+        const pageInfo = await page
+            .evaluate(() => {
+            const beats = document.querySelectorAll(".beat");
+            const dataBeats = document.querySelectorAll("[data-beat]");
+            const takes = document.querySelectorAll(".take, [data-take]");
+            const confessions = document.querySelectorAll(".confession, [data-confession]");
+            const reports = document.querySelectorAll(".report, [data-report]");
+            const slides = document.querySelectorAll(".slide, .frame, [data-slide], .card, .report-card");
+            const vessel = window.VESSEL || {};
+            const vesselHook = window.__vessel || {};
+            const anyAudio = document.querySelector("audio");
+            const audioSrc = document.getElementById("bgm")?.getAttribute("src") ||
+                document.getElementById("bedSrc")?.getAttribute("src") ||
+                (anyAudio ? anyAudio.currentSrc || anyAudio.getAttribute("src") : null);
+            let audioDurationSec = 0;
+            if (anyAudio && anyAudio.duration && isFinite(anyAudio.duration) && anyAudio.duration > 0) {
+                audioDurationSec = anyAudio.duration;
+            } // Hybrid pages expose the iMessage conversation as leading vessel
+            // frames: __hybridMsgCount message beats + 1 link-card beat + the
+            // slideshow beats. Count them so the capture includes the
+            // conversation (the actual ad) ΓÇö not just the slideshow ΓÇö and the
+            // last slideshow beat + CTA land on the right frames (the +1 is
+            // the link card).
+            const hybridMsgCount = Number(window.__hybridMsgCount || 0);
+            const vesselBeats = Math.max(beats.length, dataBeats.length);
+            return {
+                beatCount: Math.max(beats.length, dataBeats.length, takes.length, confessions.length, reports.length, slides.length),
+                vesselBeatCount: vesselBeats + hybridMsgCount + (hybridMsgCount > 0 ? 1 : 0),
+                beatMs: Number(vessel.beatMs) || 0,
+                declaredBeats: Number(vessel.beats) || 0,
+                hasVesselHook: typeof vesselHook.setBeat === "function",
+                hasLanding: vesselHook.hasLanding === true,
+                audioSrc: audioSrc || null,
+                audioDurationSec,
+            };
+        })
+            .catch(() => ({
+            beatCount: 0,
+            vesselBeatCount: 0,
+            beatMs: 0,
+            declaredBeats: 0,
+            hasVesselHook: false,
+            hasLanding: false,
+            audioSrc: null,
+            audioDurationSec: 0,
+        }));
+        const beatMs = pageInfo.beatMs || DEFAULT_BEAT_MS;
+        const audioPath = await resolveAudioForMix(opts.songUrl, pageInfo.audioSrc, opts.url, id);
+        // ΓöÇΓöÇ HIGH-FIDELITY VESSEL PATH ΓöÇΓöÇ
+        if (pageInfo.hasVesselHook && pageInfo.vesselBeatCount >= 1) {
+            console.log(`[recorder] Vessel path ΓÇö ${pageInfo.vesselBeatCount} beats (${beatMs}ms)`);
+            await page.close().catch(() => { });
+            await context.close().catch(() => { });
+            const frames = await captureVesselFrames(browser, opts.url, opts, pageInfo.vesselBeatCount, pageInfo.hasLanding, workDir);
+            if (frames.length < 1)
+                throw new Error("Vessel capture produced no frames");
+            // Audio-stretched beats: when the page carries a track, spread it across
+            // the beats (capped at 6s/beat) so the song and the slides stay in sync.
+            let effectiveBeatMs = beatMs;
+            if (pageInfo.audioDurationSec > 0) {
+                const beatsCount = pageInfo.vesselBeatCount + (pageInfo.hasLanding ? 1 : 0) + 1;
+                const perBeat = (pageInfo.audioDurationSec * 1000) / beatsCount;
+                effectiveBeatMs = Math.max(effectiveBeatMs, Math.min(6000, perBeat));
+            }
+            const rawVideoPath = (0, path_1.join)(workDir, "raw-beats.mp4");
+            const videoDurSec = await assembleBeatVideo(frames, effectiveBeatMs, rawVideoPath, viewport.width, viewport.height);
+            // Composite onto the blurred 1080├ù1920 canvas (+ audio mix).
+            const filter = buildCompositeFilter(background, viewport.width, viewport.height);
+            const audioFilter = audioPath
+                ? `[1:a]aresample=44100,aloop=loop=-1:size=2e9,atrim=0:${videoDurSec},volume=0.5,afade=t=out:st=${Math.max(0, videoDurSec - 1.2).toFixed(2)}:d=1.2,alimiter=limit=0.95[aout]`
+                : null;
+            const finalArgs = [
+                "-y",
+                "-i",
+                rawVideoPath,
+                ...(audioPath ? ["-stream_loop", "-1", "-i", audioPath] : []),
+                "-filter_complex",
+                audioFilter ? `${filter};${audioFilter}` : filter,
+                "-map",
+                "[out]",
+                ...(audioFilter ? ["-map", "[aout]"] : []),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                ...(audioPath ? ["-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2"] : ["-an"]),
+                mp4Path,
+            ];
+            await runFfmpeg(finalArgs);
+            await assertMp4Healthy(mp4Path);
+            try {
+                await (0, promises_1.unlink)(rawVideoPath);
+            }
+            catch { }
+            // Frames path: no white lead to dodge (the input is already rendered
+            // screenshots), but the same blank-frame guard is cheap insurance.
+            const thumb = await makeThumbnail(mp4Path, thumbPath, 0.45, phoneCropFilter(viewport.width, viewport.height));
+            const mp4Stat = await (0, promises_1.stat)(mp4Path);
+            return {
+                id,
+                mp4Path,
+                mp4Url: `${baseUrl}/api/record/${id}/download`,
+                thumbnailPath: thumb,
+                thumbnailUrl: thumb ? `${baseUrl}/api/record/${id}/thumbnail` : undefined,
+                mp4SizeBytes: mp4Stat.size,
+                durationMs: Math.round(videoDurSec * 1000),
+                success: true,
+                output: { width: VERTICAL_OUT_W, height: VERTICAL_OUT_H, aspectRatio },
+                frameColor: "none",
+                viewport: { width: viewport.width, height: viewport.height, name: viewport.name },
+            };
+        }
+        // ΓöÇΓöÇ SCREENCAST PATH ΓöÇΓöÇ
+        // (recordClockStart was stamped at newPage)
+        // Wait for page ready signal before capturing the opening shot.
+        try {
+            await page.waitForFunction(() => window.__vesselReady === true ||
+                window.__vessel?.ready === true ||
+                document.readyState === "complete", { timeout: 5000 });
+        }
+        catch { }
+        // Scroll to top and hold for one more short settle before marking show start.
+        try {
+            await page.evaluate(() => window.scrollTo(0, 0));
+        }
+        catch { }
+        await page.waitForTimeout(600);
+        const showStartMs = Date.now() - recordClockStart;
+        // Auto-start is handled natively by the page's own setTimeout (2000ms hero hold),
+        // or by hybrid mode's autoTimer. We no longer force startShow() here so the
+        // first frame (hero) is held long enough to be visible in the video.
+        await page
+            .evaluate(() => {
+            if (typeof window.startTransmission === "function") {
+                window.startTransmission();
+            }
+            else {
+                const btn = document.querySelector(".landing-cta, .open-btn, [data-start]");
+                if (btn)
+                    btn.click();
+            }
+        })
+            .catch(() => { });
+        // Duration: declared beats > DOM beat count > default.
+        let durationMs = opts.durationMs || 0;
+        if (autoDuration && !durationMs) {
+            if (pageInfo.declaredBeats > 0) {
+                durationMs = Math.round(pageInfo.declaredBeats * beatMs);
+            }
+            else if (pageInfo.beatCount > 0) {
+                durationMs = pageInfo.beatCount * beatMs + 5000;
+            }
+            else {
+                durationMs = DEFAULT_BEAT_MS * 3;
+            }
+            if (pageInfo.audioDurationSec > 0) {
+                durationMs = Math.max(durationMs, Math.round(pageInfo.audioDurationSec * 1000) + 1500);
+            }
+        }
+        durationMs = Math.min(durationMs || DEFAULT_BEAT_MS * 3, AUTO_LEN_CAP_MS);
+        // Drive the recording: scrollable pages scroll at a comfortable pace with
+        // intro/outro holds; fixed pages wait out the duration.
+        await page
+            .evaluate(`(${SCROLL_DRIVER_SRC})(${JSON.stringify({
+            mode: autoDuration ? "auto" : "fixed",
+            pxPerSec: SCROLL_PX_PER_SEC,
+            introMs: INTRO_HOLD_MS,
+            outroMs: OUTRO_HOLD_MS,
+            totalMs: durationMs,
+            maxIdleMs: 4000,
+        })})`)
+            .catch(() => { });
+        const showEndMs = Date.now() - recordClockStart;
+        await page.waitForTimeout(300);
+        await page.close();
+        await context.close(); // triggers Playwright to flush the .webm
+        // Find the .webm written by Playwright.
+        const webmFiles = (await (0, promises_1.readdir)(workDir)).filter((f) => f.endsWith(".webm"));
+        if (!webmFiles.length)
+            throw new Error("No webm file recorded ΓÇö Playwright may not have flushed it");
+        const webmPath = (0, path_1.join)(workDir, webmFiles[0]);
+        // Trim the blank lead, hold the first clean frame, then composite onto the
+        // blurred 9:16 canvas.
+        //
+        // showStartMs is stamped once the page reports ready AND has settled, so
+        // everything before it is navigation white. We cut to just PAST that mark
+        // (WHITE_GUARD_MS) rather than before it — cutting before was the old bug.
+        const recordedSec = Math.max(0.5, showEndMs / 1000);
+        const baseLeadSec = Math.max(0, (showStartMs + WHITE_GUARD_MS) / 1000);
+        // Verify the timer-based guess against actual pixels before trusting it —
+        // see findCleanTrimSec's docstring for why this matters once we hold it.
+        const leadSec = await findCleanTrimSec(webmPath, baseLeadSec, Math.max(baseLeadSec + 0.1, recordedSec - 0.5));
+        const bodySec = Math.max(0.5, Math.min(AUTO_LEN_CAP_MS / 1000, (durationMs + POST_ROLL_MS) / 1000, 
+        // Whatever is actually left in the webm after the lead we just cut.
+        Math.max(0.5, recordedSec - leadSec)));
+        const holdSec = HOLD_FIRST_FRAME_MS / 1000;
+        // tpad prepends the held frame, so the encoded file is longer than the body.
+        const totalSec = holdSec + bodySec;
+        const filter = buildCompositeFilter(background, viewport.width, viewport.height, holdSec, leadSec);
+        const audioFilter = audioPath
+            ? `[1:a]aresample=44100,aloop=loop=-1:size=2e9,atrim=0:${totalSec.toFixed(3)},volume=0.5,afade=t=out:st=${Math.max(0, totalSec - 1.2).toFixed(2)}:d=1.2,alimiter=limit=0.95[aout]`
+            : null;
+        const finalArgs = [
+            "-y",
+            // Trim happens safely inside the filter graph (via trim=start) rather
+            // than input -ss, ensuring it has frame-level precision on WebM inputs
+            // and doesn't chop off the tpad hold.
+            "-i",
+            webmPath,
+            ...(audioPath ? ["-stream_loop", "-1", "-i", audioPath] : []),
+            "-filter_complex",
+            audioFilter ? `${filter};${audioFilter}` : filter,
+            "-map",
+            "[out]",
+            ...(audioFilter ? ["-map", "[aout]"] : []),
+            "-t",
+            totalSec.toFixed(3),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            ...(audioPath ? ["-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2"] : ["-an"]),
+            mp4Path,
+        ];
+        await runFfmpeg(finalArgs);
+        await assertMp4Healthy(mp4Path);
+        // Clean up the interim webm + audio.
+        try {
+            await (0, promises_1.unlink)(webmPath);
+        }
+        catch { }
+        if (audioPath) {
+            try {
+                await (0, promises_1.unlink)(audioPath);
+            }
+            catch { }
+        }
+        // Sample the poster frame from the middle of the held opening frame — the
+        // one moment in the file guaranteed to be a settled, fully-painted hero.
+        const thumb = await makeThumbnail(mp4Path, thumbPath, holdSec / 2, phoneCropFilter(viewport.width, viewport.height));
+        const mp4Stat = await (0, promises_1.stat)(mp4Path);
+        return {
+            id,
+            mp4Path,
+            mp4Url: `${baseUrl}/api/record/${id}/download`,
+            thumbnailPath: thumb,
+            thumbnailUrl: thumb ? `${baseUrl}/api/record/${id}/thumbnail` : undefined,
+            mp4SizeBytes: mp4Stat.size,
+            // Report the ENCODED length, which includes the held opening frame —
+            // callers use this for upload metadata and progress, so it has to match
+            // the file rather than the pre-hold show duration.
+            durationMs: Math.round(totalSec * 1000),
+            success: true,
+            output: { width: VERTICAL_OUT_W, height: VERTICAL_OUT_H, aspectRatio },
+            frameColor: "none",
+            viewport: { width: viewport.width, height: viewport.height, name: viewport.name },
+        };
+    }
+    finally {
+        await browser.close();
+    }
+}
+// ── Job Queue ──
+const MAX_CONCURRENT_JOBS = 1;
+let runningJobsCount = 0;
+const jobQueue = [];
+async function acquireJobSlot() {
+    if (runningJobsCount < MAX_CONCURRENT_JOBS) {
+        runningJobsCount++;
+        return Promise.resolve();
+    }
+    return new Promise((resolve) => jobQueue.push(resolve));
+}
+function releaseJobSlot() {
+    if (jobQueue.length > 0) {
+        const next = jobQueue.shift();
+        next();
+    }
+    else {
+        runningJobsCount--;
+    }
+}
+// ┌────────────────────────────────────────────────────────────────────────────
+// │ Public API
+// └────────────────────────────────────────────────────────────────────────────
+/**
+ * Hard ceiling on one render, start to finish. Sized above the worst legitimate
+ * case (AUTO_LEN_CAP_MS of page time + browser launch + encode) so it only
+ * ever fires on a genuinely stuck job. Override with RECORD_JOB_TIMEOUT_MS.
+ */
+function jobTimeoutMs() {
+    const raw = Number(process.env["RECORD_JOB_TIMEOUT_MS"]);
+    return Number.isFinite(raw) && raw > 0 ? raw : 480_000;
+}
+/** Start a recording job asynchronously. Returns immediately with the job record. */
+async function startRecordingJob(opts) {
+    const id = (0, crypto_1.randomUUID)();
+    const job = {
+        id,
+        url: opts.url,
+        status: "queued",
+        progress: 0,
+        message: "Waiting in queue...",
+        startedAt: new Date().toISOString(),
+    };
+    jobs.set(id, job);
+    // Fire-and-forget — callers poll via getJob()
+    void (async () => {
+        await acquireJobSlot();
+        // Check if job was cancelled while waiting
+        const jCheck = jobs.get(id);
+        if (!jCheck) {
+            releaseJobSlot();
+            return;
+        }
+        jCheck.status = "recording";
+        jCheck.progress = 5;
+        jCheck.message = "Launching browser...";
+        const totalDuration = opts.durationMs || 30000;
+        const startTime = Date.now();
+        const ticker = setInterval(() => {
+            const elapsed = Date.now() - startTime;
+            const pct = Math.min(85, 5 + Math.round((elapsed / (totalDuration + 8000)) * 80));
+            const j = jobs.get(id);
+            if (j && j.status === "recording") {
+                j.progress = pct;
+                j.message = `RecordingΓÇª ${Math.floor(elapsed / 1000)}s elapsed`;
+            }
+        }, 500);
+        if (ticker.unref)
+            ticker.unref();
+        const limitMs = jobTimeoutMs();
+        let watchdog = null;
+        const guarded = new Promise((_, reject) => {
+            watchdog = setTimeout(() => reject(new Error(`Render exceeded ${Math.round(limitMs / 1000)}s and was abandoned`)), limitMs);
+            if (watchdog.unref)
+                watchdog.unref();
+        });
+        try {
+            // Pass the job id through so result.id === job.id (callers use the job
+            // id for retainRecording/deleteJob ΓÇö keeping them aligned avoids the
+            // classic "delete the wrong key" footgun).
+            const result = await Promise.race([recordPage(opts, id), guarded]);
+            clearInterval(ticker);
+            if (watchdog)
+                clearTimeout(watchdog);
+            const j = jobs.get(id);
+            j.status = "done";
+            j.progress = 100;
+            j.message = "Done";
+            j.finishedAt = new Date().toISOString();
+            j.result = result;
+        }
+        catch (err) {
+            clearInterval(ticker);
+            if (watchdog)
+                clearTimeout(watchdog);
+            const j = jobs.get(id);
+            j.status = "error";
+            j.progress = 0;
+            j.message = err.message;
+            j.error = err.message;
+            j.finishedAt = new Date().toISOString();
+            console.error(`[recorder] job ${id} failed:`, err.message);
+        }
+        finally {
+            releaseJobSlot();
+        }
+    })();
+    return job;
+}
+const getJob = (id) => jobs.get(id);
+exports.getJob = getJob;
+const listJobs = () => Array.from(jobs.values()).sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1));
+exports.listJobs = listJobs;
+/**
+ * The HTTP layer's name for getJob: returns the JobRecord (status/message/
+ * error/result) the bot's external client reads straight off the JSON body.
+ */
+exports.getRecordingStatus = exports.getJob;
+/**
+ * Render-binary diagnostics for /health: ffmpeg + chromium presence.
+ * Fail-open — a missing binary reports found:false instead of throwing, so the
+ * health probe always answers even on a half-built image.
+ */
+async function recorderDiagnostics() {
+    const ffmpegPath = resolveFfmpeg();
+    let ffmpegFound = false;
+    try {
+        const probe = (0, child_process_1.spawnSync)(ffmpegPath, ["-version"], { stdio: "ignore", timeout: 5000 });
+        ffmpegFound = probe.status === 0;
+    }
+    catch {
+        ffmpegFound = false;
+    }
+    const explicit = process.env["PLAYWRIGHT_CHROMIUM_PATH"];
+    if (explicit) {
+        return {
+            ffmpeg: { found: ffmpegFound, path: ffmpegPath },
+            chromium: { found: (0, fs_1.existsSync)(explicit), source: explicit },
+        };
+    }
+    const browsersPath = process.env["PLAYWRIGHT_BROWSERS_PATH"] || (0, path_1.join)((0, os_1.homedir)(), ".cache", "ms-playwright");
+    const source = `${browsersPath}/chromium-*/{chrome-linux,chrome-headless-shell-linux64}/*`;
+    // Both browser layouts ship across playwright versions: the classic
+    // `chrome-linux/chrome` + `chrome-linux/headless_shell`, and (1.49+) the
+    // headless shell moved to `chrome-headless-shell-linux64/chrome-headless-shell`.
+    const REL_BINARIES = [
+        "chrome-linux/chrome",
+        "chrome-linux/headless_shell",
+        "chrome-headless-shell-linux64/chrome-headless-shell",
+    ];
+    try {
+        const entries = await (0, promises_1.readdir)(browsersPath, { withFileTypes: true });
+        for (const entry of entries) {
+            if (!entry.isDirectory() || !/^chromium/.test(entry.name))
+                continue;
+            for (const rel of REL_BINARIES) {
+                const p = (0, path_1.join)(browsersPath, entry.name, rel);
+                if ((0, fs_1.existsSync)(p)) {
+                    return {
+                        ffmpeg: { found: ffmpegFound, path: ffmpegPath },
+                        chromium: { found: true, source: p },
+                    };
+                }
+            }
+        }
+    }
+    catch {
+        /* browsers dir missing */
+    }
+    return { ffmpeg: { found: ffmpegFound, path: ffmpegPath }, chromium: { found: false, source } };
+}
+// ΓöÇΓöÇ Job TTL eviction ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// Sweep completed/errored jobs older than 1 hour so the Map never grows
+// without bound. Active jobs (status='recording') are never evicted.
+const JOB_TTL_MS = 60 * 60 * 1000; // 1 hour
+function sweepStaleJobs() {
+    const now = Date.now();
+    for (const [id, job] of jobs) {
+        if (job.status === "recording")
+            continue; // never evict in-flight jobs
+        if (job.retain)
+            continue; // buyer-owned ΓÇö removed via deleteJob on listing purge
+        const finishedAt = job.finishedAt ? new Date(job.finishedAt).getTime() : 0;
+        if (finishedAt && now - finishedAt > JOB_TTL_MS) {
+            // Best-effort file cleanup ΓÇö don't await here
+            if (job.result?.mp4Path) {
+                (0, promises_1.unlink)(job.result.mp4Path).catch(() => { });
+            }
+            if (job.result?.thumbnailPath) {
+                (0, promises_1.unlink)(job.result.thumbnailPath).catch(() => { });
+            }
+            jobs.delete(id);
+        }
+    }
+}
+// Run sweep every 15 minutes. Attach to globalThis so hot reloads don't
+// spawn duplicate intervals.
+const globalAny2 = globalThis;
+if (!globalAny2.__RALPH_RECORD_SWEEP__) {
+    const sweep = setInterval(sweepStaleJobs, 15 * 60 * 1000);
+    // Unref so the sweep never holds the process open (matches the marketplace
+    // and scheduler background jobs) ΓÇö otherwise importing this module in
+    // tests would keep the Node event loop alive forever.
+    if (sweep.unref)
+        sweep.unref();
+    globalAny2.__RALPH_RECORD_SWEEP__ = sweep;
+}
+/**
+ * Delete a finished job's MP4 file and remove it from the registry.
+ * Safe to call even if the file is already gone ΓÇö always clears the job entry.
+ */
+async function deleteJob(id) {
+    const job = jobs.get(id);
+    if (job?.result?.mp4Path) {
+        try {
+            await (0, promises_1.unlink)(job.result.mp4Path);
+        }
+        catch {
+            /* already gone ΓÇö fine */
+        }
+    }
+    if (job?.result?.thumbnailPath) {
+        try {
+            await (0, promises_1.unlink)(job.result.thumbnailPath);
+        }
+        catch {
+            /* already gone ΓÇö fine */
+        }
+    }
+    jobs.delete(id);
+}
+/**
+ * Mark a finished recording as buyer-owned so the idle sweep never evicts it.
+ * The file then lives until deleteJob() is called (the marketplace TTL purge
+ * after the sold retention window). Returns false when the job is already
+ * gone ΓÇö e.g. a restart wiped the in-memory registry ΓÇö in which case callers
+ * should treat the file as possibly dead.
+ */
+async function retainRecording(id) {
+    const job = jobs.get(id);
+    if (!job)
+        return false;
+    job.retain = true;
+    return true;
+}
+/**
+ * Age-based sweep of the recordings directory ΓÇö unlinks any MP4 older than
+ * maxAgeMs. Safety net for orphan files whose job-registry entries were lost
+ * (e.g. a bot restart clears the in-memory job map while files survive on
+ * disk). Called by the marketplace TTL job; returns how many files removed.
+ */
+async function deleteOldRecordings(maxAgeMs, protectedIds) {
+    const cutoff = Date.now() - maxAgeMs;
+    let removed = 0;
+    try {
+        const entries = await (0, promises_1.readdir)(RECORDINGS_DIR, { withFileTypes: true });
+        for (const entry of entries) {
+            if (!entry.isFile())
+                continue;
+            if (!entry.name.endsWith(".mp4") && !entry.name.endsWith("-thumb.jpg"))
+                continue;
+            // Buyer-owned renders still within the sold retention window are exempt
+            // (their job registry entries may be lost on restart, but the paid
+            // deliverable must survive). The marketplace TTL passes them in.
+            if (protectedIds?.has(entry.name.replace("-thumb.jpg", "").slice(0, -4)))
+                continue;
+            const filePath = (0, path_1.join)(RECORDINGS_DIR, entry.name);
+            try {
+                const s = await (0, promises_1.stat)(filePath);
+                if (s.mtimeMs < cutoff) {
+                    await (0, promises_1.unlink)(filePath);
+                    removed++;
+                }
+            }
+            catch {
+                /* file may have vanished mid-sweep ΓÇö fine */
+            }
+        }
+    }
+    catch {
+        /* directory missing ΓÇö nothing to clean */
+    }
+    return removed;
+}
