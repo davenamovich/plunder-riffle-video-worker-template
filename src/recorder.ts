@@ -151,6 +151,20 @@ const AUTO_LEN_CAP_MS = 180_000;
 
 const DEFAULT_BEAT_MS = 5250; // FIXED: 5.25s per slide for all formats
 
+// The closing CTA screen (the final `__vessel.setBeat(beatCount)` state, per
+// the vessel contract above) used to be held for the SAME duration as every
+// other beat — 6s for confession, 5.25s default, etc. Cap its recording
+// window on its own so a long per-beat duration doesn't bloat the outro.
+const LAST_FRAME_HOLD_MS = 5000;
+// When a page carries spoken narration (TTS reused as the page's "bgm"
+// element, or a real music bed), the mix below fades it out and pads with
+// silence so the video always ends on a clean beat, not mid-word. This is
+// the size of that trailing silent buffer — it must match the trim/fade
+// points in the ffmpeg filter AND the audio-driven duration floor below, or
+// the two disagree and the tail either truncates real speech or leaves dead
+// air longer than intended.
+const VOICE_TAIL_MS = 3000;
+
 // ΓöÇΓöÇ In-memory job registry ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 // Stored on globalThis so it survives Node.js module hot reloads in dev.
 
@@ -885,14 +899,21 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
     let durationMs = opts.durationMs || 0;
     if (autoDuration && !durationMs) {
       if (pageInfo.declaredBeats > 0) {
-        durationMs = Math.round(pageInfo.declaredBeats * beatMs);
+        // Every beat up to the last gets its normal per-format pace; the
+        // final beat (the CTA screen) is capped at LAST_FRAME_HOLD_MS
+        // regardless of beatMs — see the constant's comment above.
+        const bodyBeats = Math.max(0, pageInfo.declaredBeats - 1);
+        durationMs = Math.round(bodyBeats * beatMs + LAST_FRAME_HOLD_MS);
       } else if (pageInfo.beatCount > 0) {
-        durationMs = pageInfo.beatCount * beatMs + 5000;
+        durationMs = pageInfo.beatCount * beatMs + LAST_FRAME_HOLD_MS;
       } else {
         durationMs = DEFAULT_BEAT_MS * 3;
       }
       if (pageInfo.audioDurationSec > 0) {
-        durationMs = Math.max(durationMs, Math.round(pageInfo.audioDurationSec * 1000) + 1500);
+        // Floor must be at least as large as the VOICE_TAIL_MS the ffmpeg
+        // mix below trims/fades off the end, or that trim eats into real
+        // speech instead of the silent buffer it's meant to be.
+        durationMs = Math.max(durationMs, Math.round(pageInfo.audioDurationSec * 1000) + VOICE_TAIL_MS);
       }
     }
     durationMs = Math.min(durationMs || DEFAULT_BEAT_MS * 3, AUTO_LEN_CAP_MS);
@@ -938,8 +959,13 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
     const showDurSec = Math.min(targetDurSecWithBuffer, maxAvailableSec);
 
     const filter = buildCompositeFilter(background, viewport.width, viewport.height, 0, 0);
+    // Voice/music cuts VOICE_TAIL_MS before the video ends, fading out over
+    // the FADE_DUR_SEC just before that cut point, then pads with silence to
+    // the true end — the video always finishes on quiet, not mid-word.
+    const voiceTailSec = VOICE_TAIL_MS / 1000;
+    const fadeDurSec = 1.2;
     const audioFilter = audioPath
-      ? `[1:a]aresample=44100,aloop=loop=-1:size=2e9,atrim=0:${Math.max(0, showDurSec - 5).toFixed(3)},volume=0.5,afade=t=out:st=${Math.max(0, showDurSec - 6.2).toFixed(2)}:d=1.2,apad,atrim=0:${showDurSec.toFixed(3)},alimiter=limit=0.95[aout]`
+      ? `[1:a]aresample=44100,aloop=loop=-1:size=2e9,atrim=0:${Math.max(0, showDurSec - voiceTailSec).toFixed(3)},volume=0.5,afade=t=out:st=${Math.max(0, showDurSec - voiceTailSec - fadeDurSec).toFixed(2)}:d=${fadeDurSec},apad,atrim=0:${showDurSec.toFixed(3)},alimiter=limit=0.95[aout]`
       : null;
 
     const trimArgs = [
