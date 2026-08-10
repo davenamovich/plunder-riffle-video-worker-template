@@ -10,7 +10,7 @@ import path from "path";
 import fs from "fs";
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "100mb" }));
 
 // ── Auth guard ──────────────────────────────────────────────────────────────
 // The bot sends `x-operator-secret: <TELEGRAM_WEBHOOK_SECRET>` on every render

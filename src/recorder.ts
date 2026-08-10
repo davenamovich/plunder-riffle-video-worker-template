@@ -145,7 +145,7 @@ const WHITE_GUARD_MS = 1500;
  * held the white for longer. `leadSec` is now verified against the actual
  * pixels first (see `findCleanTrimSec`), so the hold is safe to re-enable.
  */
-const HOLD_FIRST_FRAME_MS = 4500;
+const HOLD_FIRST_FRAME_MS = 6500;
 const POST_ROLL_MS = 2200; // cut 2s from end to remove white — small tail kept after the show when trimming
 const AUTO_LEN_CAP_MS = 180_000;
 
@@ -219,29 +219,6 @@ function runFfmpeg(args: string[]): Promise<void> {
       clearTimeout(killer);
       reject(e);
     });
-  });
-}
-
-async function probeDuration(p: string): Promise<number | null> {
-  return new Promise((resolve) => {
-    const { spawn } = require("child_process");
-    const proc = spawn("ffmpeg", ["-i", p, "-f", "null", "-"]);
-    let out = "";
-    proc.stderr.on("data", (d: Buffer) => (out += d));
-    proc.on("close", () => {
-      const matches = out.match(/time=(\d+):(\d+):(\d+\.\d+)/g);
-      if (matches && matches.length > 0) {
-        const last = matches[matches.length - 1];
-        const parts = last.replace("time=", "").split(":");
-        const h = parseInt(parts[0], 10);
-        const m = parseInt(parts[1], 10);
-        const s = parseFloat(parts[2]);
-        resolve(h * 3600 + m * 60 + s);
-      } else {
-        resolve(null);
-      }
-    });
-    proc.on("error", () => resolve(null));
   });
 }
 
@@ -636,156 +613,7 @@ async function resolveAudioForMix(
 //   n === beatCount ΓåÆ CTA screen
 // Screenshots each state supersampled so the final upscale stays crisp.
 
-async function captureVesselFrames(
-  browser: any,
-  pageUrl: string,
-  opts: RecordOptions,
-  beatCount: number,
-  hasLanding: boolean,
-  dir: string,
-): Promise<string[]> {
-  const vp = VIEWPORTS[opts.viewport || "vertical"];
-  const W = vp.width;
-  const H = vp.height;
 
-  const { devices } = await import("playwright-core");
-  const ctx = await browser.newContext({
-    ...devices["iPhone 14"],
-    viewport: { width: W, height: H },
-    deviceScaleFactor: SUPERSAMPLE,
-    reducedMotion: "reduce" as const,
-  });
-  const page = await ctx.newPage();
-
-  const url = new URL(pageUrl);
-  url.searchParams.set("mode", "frame");
-  try {
-    await page.goto(url.toString(), { waitUntil: opts.waitUntil || "load", timeout: 30_000 });
-  } catch (err: any) {
-    console.warn(`[recorder] vessel capture goto warning: ${err?.message ?? err}`);
-  }
-
-  // Never screenshot before fonts settle ΓÇö a font swap mid-capture is the #1
-  // cause of a visibly wrong frame. Then wait for the page's vessel hook.
-  // (In ?mode=frame the builders also disable entrance/reveal animations so
-  // screenshots are deterministic ΓÇö see the .frame-mode CSS in the builders.)
-  try {
-    await page.evaluate(() => (document as any).fonts?.ready).catch(() => {});
-  } catch {}
-  try {
-    await page.waitForFunction(() => (window as any).__vessel?.ready === true, {
-      timeout: 10_000,
-    });
-  } catch {
-    // No vessel.ready (old page) ΓÇö the settle wait below covers it.
-  }
-  await page.waitForTimeout(400);
-
-  const frames: number[] = [];
-  if (hasLanding) frames.push(-1);
-  for (let i = 0; i < beatCount; i++) frames.push(i);
-  frames.push(beatCount); // CTA
-
-  const paths: string[] = [];
-  for (let i = 0; i < frames.length; i++) {
-    const n = frames[i];
-    await page
-      .evaluate((idx: number) => {
-        const v = (window as any).__vessel;
-        if (v && typeof v.setBeat === "function") v.setBeat(idx);
-      }, n)
-      .catch(() => {});
-    // The first frame gets a longer settle (React rendering + entrance animations,
-    // even when disabled, need time to commit); subsequent beats need ~400ms to swap.
-    const isFirst = i === 0;
-    await page.waitForTimeout(isFirst ? 2500 : 400);
-    const name = n === -1 ? "hero" : String(n);
-    const p = join(dir, `beat-${name}.png`);
-    await page.screenshot({ path: p, type: "png" });
-    paths.push(p);
-  }
-
-  await ctx.close().catch(() => {});
-  return paths;
-}
-
-/**
- * Assemble per-beat PNGs into a phone-sized video with Ken Burns motion per
- * beat and crossfades between them (ported from plunder's
- * render-transmission-video filter graph ΓÇö including the zoompan `d=1` gotcha:
- * with `-loop 1` the input is already N frames, so `d` must be 1 and the zoom
- * is driven by `on`, the output frame index).
- */
-async function assembleBeatVideo(
-  frames: string[],
-  beatMs: number,
-  outPath: string,
-  phoneW: number,
-  phoneH: number,
-): Promise<number> {
-  const n = frames.length;
-  if (n < 1) throw new Error("assembleBeatVideo: need >= 1 frame");
-  const T = TRANSITION_SEC;
-  const D = Math.max(1.8, beatMs / 1000);
-  const total = n === 1 ? D : D + (n - 1) * (D - T);
-  if (total > AUTO_LEN_CAP_MS / 1000) {
-    throw new Error(
-      `Render would be ${total.toFixed(1)}s ΓÇö slideshow caps at ${AUTO_LEN_CAP_MS / 1000}s. Reduce beats.`,
-    );
-  }
-
-  const args: string[] = ["-y"];
-  for (const f of frames) args.push("-loop", "1", "-framerate", String(FPS), "-i", f);
-
-  const parts: string[] = [];
-  for (let i = 0; i < n; i++) {
-    const z = i % 2 === 0 ? "min(1+0.0009*on,1.10)" : "max(1.10-0.0009*on,1.0)";
-    parts.push(
-      `[${i}:v]trim=duration=${D},setpts=PTS-STARTPTS,` +
-        `scale=${Math.round(phoneW * 1.1)}:${Math.round(phoneH * 1.1)}:flags=lanczos,` +
-        `zoompan=z='${z}':d=1:x='ih/2-(ih/zoom/2)':y='ih/2-(ih/zoom/2)':` +
-        `s=${phoneW}x${phoneH}:fps=${FPS},setsar=1[v${i}]`,
-    );
-  }
-
-  let prev = "[v0]";
-  let finalLabel = "[v0]";
-  for (let k = 1; k < n; k++) {
-    const offset = (D + (k - 1) * (D - T) - T).toFixed(3);
-    const out = k === n - 1 ? "[vout]" : `[x${k}]`;
-    parts.push(`${prev}[v${k}]xfade=transition=fade:duration=${T}:offset=${offset}${out}`);
-    prev = out;
-    finalLabel = out;
-  }
-
-  args.push("-filter_complex", parts.join(";"));
-  args.push("-map", finalLabel);
-  args.push(
-    "-c:v",
-    "libx264",
-    "-profile:v",
-    "high",
-    "-level",
-    "4.0",
-    "-preset",
-    "medium",
-    "-crf",
-    "19",
-    "-pix_fmt",
-    "yuv420p",
-    "-r",
-    String(FPS),
-    "-g",
-    String(FPS * 2),
-    "-movflags",
-    "+faststart",
-    "-t",
-    total.toFixed(3),
-    outPath,
-  );
-  await runFfmpeg(args);
-  return total;
-}
 
 // ΓöÇΓöÇ Scroll driver (screencast path) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 // Ported from plunder's closed-loop timing: intro hold ΓåÆ constant-pace scroll
@@ -948,7 +776,7 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
         } // Hybrid pages expose the iMessage conversation as leading vessel
         // frames: __hybridMsgCount message beats + 1 link-card beat + the
         // slideshow beats. Count them so the capture includes the
-        // conversation (the actual ad) ΓÇö not just the slideshow ΓÇö and the
+        // conversation (the actual ad) — not just the slideshow — and the
         // last slideshow beat + CTA land on the right frames (the +1 is
         // the link card).
         const msgs = document.querySelectorAll(".msg-row");
@@ -989,97 +817,7 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
     const beatMs = pageInfo.beatMs || DEFAULT_BEAT_MS;
     const audioPath = await resolveAudioForMix(opts.songUrl, pageInfo.audioSrc, opts.url, id);
 
-    // ΓöÇΓöÇ HIGH-FIDELITY VESSEL PATH ΓöÇΓöÇ
-    if (pageInfo.hasVesselHook && pageInfo.vesselBeatCount >= 1 && !pageInfo.isImessage) {
-      console.log(`[recorder] Vessel path ΓÇö ${pageInfo.vesselBeatCount} beats (${beatMs}ms)`);
-      await page.close().catch(() => {});
-      await context.close().catch(() => {});
 
-      const frames = await captureVesselFrames(
-        browser,
-        opts.url,
-        opts,
-        pageInfo.vesselBeatCount,
-        pageInfo.hasLanding,
-        workDir,
-      );
-      if (frames.length < 1) throw new Error("Vessel capture produced no frames");
-
-      // Audio-stretched beats: when the page carries a track, spread it across
-      // the beats (capped at 6s/beat) so the song and the slides stay in sync.
-      let effectiveBeatMs = beatMs;
-      if (pageInfo.audioDurationSec > 0) {
-        const beatsCount = pageInfo.vesselBeatCount + (pageInfo.hasLanding ? 1 : 0) + 1;
-        const perBeat = (pageInfo.audioDurationSec * 1000) / beatsCount;
-        effectiveBeatMs = Math.max(effectiveBeatMs, Math.min(6000, perBeat));
-      }
-
-      const rawVideoPath = join(workDir, "raw-beats.mp4");
-      const videoDurSec = await assembleBeatVideo(
-        frames,
-        effectiveBeatMs,
-        rawVideoPath,
-        viewport.width,
-        viewport.height,
-      );
-
-      // Composite onto the blurred 1080├ù1920 canvas (+ audio mix).
-      const filter = buildCompositeFilter(background, viewport.width, viewport.height);
-      const audioFilter = audioPath
-        ? `[1:a]aresample=44100,aloop=loop=-1:size=2e9,atrim=0:${videoDurSec},volume=0.5,afade=t=out:st=${Math.max(0, videoDurSec - 1.2).toFixed(2)}:d=1.2,alimiter=limit=0.95[aout]`
-        : null;
-      const finalArgs = [
-        "-y",
-        "-i",
-        rawVideoPath,
-        ...(audioPath ? ["-stream_loop", "-1", "-i", audioPath] : []),
-        "-filter_complex",
-        audioFilter ? `${filter};${audioFilter}` : filter,
-        "-map",
-        "[out]",
-        ...(audioFilter ? ["-map", "[aout]"] : []),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "fast",
-        "-crf",
-        "23",
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
-        ...(audioPath ? ["-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2"] : ["-an"]),
-        mp4Path,
-      ];
-      await runFfmpeg(finalArgs);
-      await assertMp4Healthy(mp4Path);
-      try {
-        await unlink(rawVideoPath);
-      } catch {}
-
-      // Frames path: no white lead to dodge (the input is already rendered
-      // screenshots), but the same blank-frame guard is cheap insurance.
-      const thumb = await makeThumbnail(
-        mp4Path,
-        thumbPath,
-        0.45,
-        phoneCropFilter(viewport.width, viewport.height),
-      );
-      const mp4Stat = await stat(mp4Path);
-      return {
-        id,
-        mp4Path,
-        mp4Url: `${baseUrl}/api/record/${id}/download`,
-        thumbnailPath: thumb,
-        thumbnailUrl: thumb ? `${baseUrl}/api/record/${id}/thumbnail` : undefined,
-        mp4SizeBytes: mp4Stat.size,
-        durationMs: Math.round(videoDurSec * 1000),
-        success: true,
-        output: { width: VERTICAL_OUT_W, height: VERTICAL_OUT_H, aspectRatio },
-        frameColor: "none",
-        viewport: { width: viewport.width, height: viewport.height, name: viewport.name },
-      };
-    }
 
     // ΓöÇΓöÇ SCREENCAST PATH ΓöÇΓöÇ
     // (recordClockStart was stamped at newPage)
@@ -1107,7 +845,9 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
     // first frame (hero) is held long enough to be visible in the video.
     await page
       .evaluate(() => {
-        if (typeof (window as any).startTransmission === "function") {
+        if (typeof (window as any).startShow === "function") {
+          (window as any).startShow();
+        } else if (typeof (window as any).startTransmission === "function") {
           (window as any).startTransmission();
         } else {
           const btn = document.querySelector(
@@ -1134,20 +874,7 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
     }
     durationMs = Math.min(durationMs || DEFAULT_BEAT_MS * 3, AUTO_LEN_CAP_MS);
 
-    // Drive the recording: scrollable pages scroll at a comfortable pace with
-    // intro/outro holds; fixed pages wait out the duration.
-    await page
-      .evaluate(
-        `(${SCROLL_DRIVER_SRC})(${JSON.stringify({
-          mode: autoDuration ? "auto" : "fixed",
-          pxPerSec: SCROLL_PX_PER_SEC,
-          introMs: INTRO_HOLD_MS,
-          outroMs: OUTRO_HOLD_MS,
-          totalMs: durationMs,
-          maxIdleMs: 4000,
-        })})`,
-      )
-      .catch(() => {});
+    await page.waitForTimeout(durationMs);
 
     const showEndMs = Date.now() - recordClockStart;
     await page.waitForTimeout(300);
@@ -1158,47 +885,46 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
     // Find the .webm written by Playwright.
     const webmFiles = (await readdir(workDir)).filter((f) => f.endsWith(".webm"));
     if (!webmFiles.length)
-      throw new Error("No webm file recorded ΓÇö Playwright may not have flushed it");
+      throw new Error("No webm file recorded — Playwright may not have flushed it");
     const webmPath = join(workDir, webmFiles[0]);
 
     // Trim the blank lead, hold the first clean frame, then composite onto the
     // blurred 9:16 canvas.
     //
-    const totalRecordedSec = Math.max(0.5, showEndMs / 1000);
-    const probedSec = await probeDuration(webmPath);
-    const videoLenSec = probedSec ?? totalRecordedSec;
-
-    const tailSec = 0.35; // 300ms wait + ~50ms page.close overhead
-    const endTrim = 0;
-    
-    const estShowMs = durationMs;
-    const targetDurSec = Math.min(
-      AUTO_LEN_CAP_MS / 1000,
-      Math.max(0.5, (estShowMs + POST_ROLL_MS) / 1000 - endTrim)
+    // showStartMs is stamped once the page reports ready AND has settled, so
+    // everything before it is navigation white. We cut to just PAST that mark
+    // (WHITE_GUARD_MS) rather than before it — cutting before was the old bug.
+    const recordedSec = Math.max(0.5, showEndMs / 1000);
+    const baseLeadSec = Math.max(0, (showStartMs + WHITE_GUARD_MS) / 1000);
+    // Verify the timer-based guess against actual pixels before trusting it —
+    // see findCleanTrimSec's docstring for why this matters once we hold it.
+    const leadSec = await findCleanTrimSec(
+      webmPath,
+      baseLeadSec,
+      Math.max(baseLeadSec + 0.1, recordedSec - 0.5),
     );
+    const bodySec = Math.max(
+      0.5,
+      Math.min(
+        AUTO_LEN_CAP_MS / 1000,
+        (durationMs + POST_ROLL_MS) / 1000,
+        // Whatever is actually left in the webm after the lead we just cut.
+        Math.max(0.5, recordedSec - leadSec),
+      ),
+    );
+    const holdSec = HOLD_FIRST_FRAME_MS / 1000;
+    // tpad prepends the held frame, so the encoded file is longer than the body.
+    const totalSec = holdSec + bodySec;
 
-    const FRONT_BUFFER_SEC = 0.5;
-    const actualLeadIn = Math.max(0, videoLenSec - targetDurSec - tailSec);
-    const baseStartSec = Math.max(0, actualLeadIn - FRONT_BUFFER_SEC);
-    const startSec = baseStartSec;
-    
-    const appliedFrontBuffer = actualLeadIn - baseStartSec;
-    const targetDurSecWithBuffer = targetDurSec + appliedFrontBuffer;
-    const maxAvailableSec = Math.max(0.5, videoLenSec - startSec - endTrim);
-    const showDurSec = Math.min(targetDurSecWithBuffer, maxAvailableSec);
-
-    const filter = buildCompositeFilter(background, viewport.width, viewport.height, 0, 0);
+    const filter = buildCompositeFilter(background, viewport.width, viewport.height, holdSec, leadSec);
     const audioFilter = audioPath
-      ? `[1:a]aresample=44100,aloop=loop=-1:size=2e9,atrim=0:${Math.max(0, showDurSec - 5).toFixed(3)},volume=0.5,afade=t=out:st=${Math.max(0, showDurSec - 6.2).toFixed(2)}:d=1.2,apad,atrim=0:${showDurSec.toFixed(3)},alimiter=limit=0.95[aout]`
+      ? `[1:a]aresample=44100,aloop=loop=-1:size=2e9,atrim=0:${Math.max(0, totalSec - 5).toFixed(3)},volume=0.5,afade=t=out:st=${Math.max(0, totalSec - 6.2).toFixed(2)}:d=1.2,apad,atrim=0:${totalSec.toFixed(3)},alimiter=limit=0.95[aout]`
       : null;
-
-    const trimArgs = [
-      "-ss", startSec.toFixed(3),
-      "-t", showDurSec.toFixed(3),
-    ];
-
-    const finalArgs = [
+    const finalArgs: string[] = [
       "-y",
+      // Trim happens safely inside the filter graph (via trim=start) rather
+      // than input -ss, ensuring it has frame-level precision on WebM inputs
+      // and doesn't chop off the tpad hold.
       "-i",
       webmPath,
       ...(audioPath ? ["-stream_loop", "-1", "-i", audioPath] : []),
@@ -1207,7 +933,8 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
       "-map",
       "[out]",
       ...(audioFilter ? ["-map", "[aout]"] : []),
-      ...trimArgs,
+      "-t",
+      totalSec.toFixed(3),
       "-c:v",
       "libx264",
       "-preset",
@@ -1218,8 +945,6 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
       "yuv420p",
       "-movflags",
       "+faststart",
-      "-vsync",
-      "vfr",
       ...(audioPath ? ["-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2"] : ["-an"]),
       mp4Path,
     ];
@@ -1241,7 +966,7 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
     const thumb = await makeThumbnail(
       mp4Path,
       thumbPath,
-      Math.min(1.0, showDurSec / 2),
+      holdSec / 2,
       phoneCropFilter(viewport.width, viewport.height),
     );
     const mp4Stat = await stat(mp4Path);
@@ -1255,7 +980,7 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
       // Report the ENCODED length, which includes the held opening frame —
       // callers use this for upload metadata and progress, so it has to match
       // the file rather than the pre-hold show duration.
-      durationMs: Math.round(showDurSec * 1000),
+      durationMs: Math.round(totalSec * 1000),
       success: true,
       output: { width: VERTICAL_OUT_W, height: VERTICAL_OUT_H, aspectRatio },
       frameColor: "none",
@@ -1561,3 +1286,4 @@ export async function deleteOldRecordings(
   }
   return removed;
 }
+
