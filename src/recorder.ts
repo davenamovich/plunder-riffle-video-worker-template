@@ -222,6 +222,29 @@ function runFfmpeg(args: string[]): Promise<void> {
   });
 }
 
+async function probeDuration(p: string): Promise<number | null> {
+  return new Promise((resolve) => {
+    const { spawn } = require("child_process");
+    const proc = spawn("ffmpeg", ["-i", p, "-f", "null", "-"]);
+    let out = "";
+    proc.stderr.on("data", (d: Buffer) => (out += d));
+    proc.on("close", () => {
+      const matches = out.match(/time=(\d+):(\d+):(\d+\.\d+)/g);
+      if (matches && matches.length > 0) {
+        const last = matches[matches.length - 1];
+        const parts = last.replace("time=", "").split(":");
+        const h = parseInt(parts[0], 10);
+        const m = parseInt(parts[1], 10);
+        const s = parseFloat(parts[2]);
+        resolve(h * 3600 + m * 60 + s);
+      } else {
+        resolve(null);
+      }
+    });
+    proc.on("error", () => resolve(null));
+  });
+}
+
 async function fileExists(p: string): Promise<boolean> {
   try {
     await stat(p);
@@ -891,40 +914,41 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
     // Trim the blank lead, hold the first clean frame, then composite onto the
     // blurred 9:16 canvas.
     //
-    // showStartMs is stamped once the page reports ready AND has settled, so
-    // everything before it is navigation white. We cut to just PAST that mark
-    // (WHITE_GUARD_MS) rather than before it — cutting before was the old bug.
-    const recordedSec = Math.max(0.5, showEndMs / 1000);
-    const baseLeadSec = Math.max(0, (showStartMs + WHITE_GUARD_MS) / 1000);
-    // Verify the timer-based guess against actual pixels before trusting it —
-    // see findCleanTrimSec's docstring for why this matters once we hold it.
-    const leadSec = await findCleanTrimSec(
-      webmPath,
-      baseLeadSec,
-      Math.max(baseLeadSec + 0.1, recordedSec - 0.5),
-    );
-    const bodySec = Math.max(
-      0.5,
-      Math.min(
-        AUTO_LEN_CAP_MS / 1000,
-        (durationMs + POST_ROLL_MS) / 1000,
-        // Whatever is actually left in the webm after the lead we just cut.
-        Math.max(0.5, recordedSec - leadSec),
-      ),
-    );
-    const holdSec = HOLD_FIRST_FRAME_MS / 1000;
-    // tpad prepends the held frame, so the encoded file is longer than the body.
-    const totalSec = holdSec + bodySec;
+    const totalRecordedSec = Math.max(0.5, showEndMs / 1000);
+    const probedSec = await probeDuration(webmPath);
+    const videoLenSec = probedSec ?? totalRecordedSec;
 
-    const filter = buildCompositeFilter(background, viewport.width, viewport.height, holdSec, leadSec);
+    const tailSec = 0.35; // 300ms wait + ~50ms page.close overhead
+    const endTrim = 0;
+    
+    const estShowMs = durationMs;
+    const targetDurSec = Math.min(
+      AUTO_LEN_CAP_MS / 1000,
+      Math.max(0.5, (estShowMs + POST_ROLL_MS) / 1000 - endTrim)
+    );
+
+    const FRONT_BUFFER_SEC = 0.5;
+    const actualLeadIn = Math.max(0, videoLenSec - targetDurSec - tailSec);
+    const baseStartSec = Math.max(0, actualLeadIn - FRONT_BUFFER_SEC);
+    const startSec = baseStartSec;
+    
+    const appliedFrontBuffer = actualLeadIn - baseStartSec;
+    const targetDurSecWithBuffer = targetDurSec + appliedFrontBuffer;
+    const maxAvailableSec = Math.max(0.5, videoLenSec - startSec - endTrim);
+    const showDurSec = Math.min(targetDurSecWithBuffer, maxAvailableSec);
+
+    const filter = buildCompositeFilter(background, viewport.width, viewport.height, 0, 0);
     const audioFilter = audioPath
-      ? `[1:a]aresample=44100,aloop=loop=-1:size=2e9,atrim=0:${Math.max(0, totalSec - 5).toFixed(3)},volume=0.5,afade=t=out:st=${Math.max(0, totalSec - 6.2).toFixed(2)}:d=1.2,apad,atrim=0:${totalSec.toFixed(3)},alimiter=limit=0.95[aout]`
+      ? `[1:a]aresample=44100,aloop=loop=-1:size=2e9,atrim=0:${Math.max(0, showDurSec - 5).toFixed(3)},volume=0.5,afade=t=out:st=${Math.max(0, showDurSec - 6.2).toFixed(2)}:d=1.2,apad,atrim=0:${showDurSec.toFixed(3)},alimiter=limit=0.95[aout]`
       : null;
+
+    const trimArgs = [
+      "-ss", startSec.toFixed(3),
+      "-t", showDurSec.toFixed(3),
+    ];
+
     const finalArgs: string[] = [
       "-y",
-      // Trim happens safely inside the filter graph (via trim=start) rather
-      // than input -ss, ensuring it has frame-level precision on WebM inputs
-      // and doesn't chop off the tpad hold.
       "-i",
       webmPath,
       ...(audioPath ? ["-stream_loop", "-1", "-i", audioPath] : []),
@@ -933,8 +957,7 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
       "-map",
       "[out]",
       ...(audioFilter ? ["-map", "[aout]"] : []),
-      "-t",
-      totalSec.toFixed(3),
+      ...trimArgs,
       "-c:v",
       "libx264",
       "-preset",
@@ -945,6 +968,8 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
       "yuv420p",
       "-movflags",
       "+faststart",
+      "-vsync",
+      "vfr",
       ...(audioPath ? ["-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2"] : ["-an"]),
       mp4Path,
     ];
@@ -961,12 +986,10 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
       } catch {}
     }
 
-    // Sample the poster frame from the middle of the held opening frame — the
-    // one moment in the file guaranteed to be a settled, fully-painted hero.
     const thumb = await makeThumbnail(
       mp4Path,
       thumbPath,
-      holdSec / 2,
+      Math.min(1.0, showDurSec / 2),
       phoneCropFilter(viewport.width, viewport.height),
     );
     const mp4Stat = await stat(mp4Path);
@@ -980,7 +1003,7 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
       // Report the ENCODED length, which includes the held opening frame —
       // callers use this for upload metadata and progress, so it has to match
       // the file rather than the pre-hold show duration.
-      durationMs: Math.round(totalSec * 1000),
+      durationMs: Math.round(showDurSec * 1000),
       success: true,
       output: { width: VERTICAL_OUT_W, height: VERTICAL_OUT_H, aspectRatio },
       frameColor: "none",
