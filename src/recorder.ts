@@ -836,6 +836,7 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
           hasLanding: vesselHook.hasLanding === true,
           audioSrc: audioSrc || null,
           audioDurationSec,
+          recordDurationMs: Number(vessel.recordDurationMs) || 0,
           isImessage: msgs.length > 0,
         };
       })
@@ -848,6 +849,7 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
         hasLanding: false,
         audioSrc: null as string | null,
         audioDurationSec: 0,
+        recordDurationMs: 0,
         isImessage: false,
       }));
 
@@ -898,7 +900,10 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
     // Duration: declared beats > DOM beat count > default.
     let durationMs = opts.durationMs || 0;
     if (autoDuration && !durationMs) {
-      if (pageInfo.declaredBeats > 0) {
+      if (pageInfo.recordDurationMs && pageInfo.recordDurationMs > 0) {
+        console.log(`[recorder] Using page-declared recordDurationMs: ${pageInfo.recordDurationMs}ms`);
+        durationMs = pageInfo.recordDurationMs;
+      } else if (pageInfo.declaredBeats > 0) {
         // Every beat up to the last gets its normal per-format pace; the
         // final beat (the CTA screen) is capped at LAST_FRAME_HOLD_MS
         // regardless of beatMs — see the constant's comment above.
