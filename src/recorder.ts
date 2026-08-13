@@ -149,7 +149,7 @@ const HOLD_FIRST_FRAME_MS = 6500;
 const POST_ROLL_MS = 2200; // cut 2s from end to remove white — small tail kept after the show when trimming
 const AUTO_LEN_CAP_MS = 180_000;
 
-const DEFAULT_BEAT_MS = 5250; // FIXED: 5.25s per slide for all formats
+const DEFAULT_BEAT_MS = 3000; // FIXED: 3s per slide for all formats
 
 // The closing CTA screen (the final `__vessel.setBeat(beatCount)` state, per
 // the vessel contract above) used to be held for the SAME duration as every

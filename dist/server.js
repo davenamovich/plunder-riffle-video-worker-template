@@ -8,7 +8,7 @@ const recorder_1 = require("./src/recorder");
 const path_1 = __importDefault(require("path"));
 const fs_1 = __importDefault(require("fs"));
 const app = (0, express_1.default)();
-app.use(express_1.default.json());
+app.use(express_1.default.json({ limit: "100mb" }));
 // ── Auth guard ──────────────────────────────────────────────────────────────
 // The bot sends `x-operator-secret: <TELEGRAM_WEBHOOK_SECRET>` on every render
 // request (bot/src/lib/recorder.ts externalAuthHeaders). Setting WORKER_SECRET
