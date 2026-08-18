@@ -51,6 +51,12 @@ app.post("/api/record", requireSecret, async (req, res) => {
       waitUntil: req.body.waitUntil,
       extraWaitMs: req.body.extraWaitMs,
       songUrl: req.body.songUrl,
+      musicUrl: typeof req.body?.musicUrl === "string" ? req.body.musicUrl : undefined,
+      outWidth: typeof req.body?.outWidth === "number" ? req.body.outWidth : undefined,
+      outHeight: typeof req.body?.outHeight === "number" ? req.body.outHeight : undefined,
+      audioVolume: typeof req.body?.audioVolume === "number" ? req.body.audioVolume : undefined,
+      musicVolume: typeof req.body?.musicVolume === "number" ? req.body.musicVolume : undefined,
+      timeoutMs: typeof req.body?.timeoutMs === "number" ? req.body.timeoutMs : undefined,
     };
     console.log(`[worker] Starting recording for ${url}`);
     const job = await startRecordingJob(opts);
