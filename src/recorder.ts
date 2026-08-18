@@ -45,12 +45,14 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { randomUUID } from "crypto";
 
+// === worker-only BEGIN: getEnv shim (bot imports { getEnv } from "../env") ===
 // Standalone worker has no ../env module — inline the same fail-open reader so
 // the engine below stays byte-identical to bot/src/lib/video/recorder.ts.
 function getEnv(key: string, fallback: string = ""): string {
   const v = process.env[key];
   return v && v.trim().length > 0 ? v : fallback;
 }
+// === worker-only END: getEnv shim ===
 
 // ΓöÇΓöÇ Types ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
@@ -1844,6 +1846,7 @@ export const getJob = (id: string): JobRecord | undefined => jobs.get(id);
 export const listJobs = (): JobRecord[] =>
   Array.from(jobs.values()).sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1));
 
+// === worker-only BEGIN: HTTP-layer exports (getRecordingStatus + recorderDiagnostics) ===
 /**
  * The HTTP layer's name for getJob: returns the JobRecord (status/message/
  * error/result) the bot's external client reads straight off the JSON body.
@@ -1865,6 +1868,7 @@ export async function recorderDiagnostics(): Promise<{
     chromium: { found: diag.chromiumFound, source: diag.chromiumSource },
   };
 }
+// === worker-only END: HTTP-layer exports ===
 
 // ΓöÇΓöÇ Job TTL eviction ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 // Sweep completed/errored jobs older than 1 hour so the Map never grows
