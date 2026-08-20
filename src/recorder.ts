@@ -1278,7 +1278,7 @@ export function buildAudioMixFilter(o: {
     // The voice label feeds BOTH the sidechain compressor and the final amix.
     // This ffmpeg build rejects a reused label as a second input, so the
     // voice is duplicated with asplit — the sidechain only DIPS the bed.
-    const voice = `[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,aloop=loop=-1:size=2e9,atrim=0:${voiceTail.toFixed(3)},volume=${voiceVol.toFixed(2)},afade=t=out:st=${Math.max(0, voiceTail - o.fadeDurSec).toFixed(2)}:d=${o.fadeDurSec},apad,atrim=0:${dur.toFixed(3)},asplit=2[voice][voice2]`;
+    const voice = `[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=0:${voiceTail.toFixed(3)},volume=${voiceVol.toFixed(2)},afade=t=out:st=${Math.max(0, voiceTail - o.fadeDurSec).toFixed(2)}:d=${o.fadeDurSec},apad,atrim=0:${dur.toFixed(3)},asplit=2[voice][voice2]`;
     return `${voice};${musicChain}[music];[music][voice]sidechaincompress=threshold=0.04:ratio=12:attack=30:release=350[duck];[duck][voice2]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[aout]`;
   }
   if (o.hasMusic) {
@@ -1288,7 +1288,7 @@ export function buildAudioMixFilter(o: {
   if (o.autoDuration) {
     return `[1:a]aresample=44100,apad,atrim=0:${dur.toFixed(3)},alimiter=limit=0.95[aout]`;
   }
-  return `[1:a]aresample=44100,aloop=loop=-1:size=2e9,atrim=0:${voiceTail.toFixed(3)},volume=${voiceVol.toFixed(2)},afade=t=out:st=${Math.max(0, voiceTail - o.fadeDurSec).toFixed(2)}:d=${o.fadeDurSec},apad,atrim=0:${dur.toFixed(3)},alimiter=limit=0.95[aout]`;
+  return `[1:a]aresample=44100,atrim=0:${voiceTail.toFixed(3)},volume=${voiceVol.toFixed(2)},afade=t=out:st=${Math.max(0, voiceTail - o.fadeDurSec).toFixed(2)}:d=${o.fadeDurSec},apad,atrim=0:${dur.toFixed(3)},alimiter=limit=0.95[aout]`;
 }
 
 /**
@@ -1380,7 +1380,9 @@ export async function composeScreencastToMp4(
     ...inputSeekArgs,
     "-i",
     webmPath,
-    ...(audioPath ? ["-stream_loop", "-1", "-i", audioPath] : []),
+    // Narration is a single-play track; apad supplies silence after it ends.
+    // Only the optional music bed is looped below.
+    ...(audioPath ? ["-i", audioPath] : []),
     ...(musicPath ? ["-stream_loop", "-1", "-i", musicPath] : []),
     "-filter_complex",
     audioFilter ? `${filter};${audioFilter}` : filter,
