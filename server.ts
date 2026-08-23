@@ -4,6 +4,8 @@ import {
   getJob,
   deleteJob,
   recorderDiagnostics,
+  resolveChromium,
+  collectPageInfo,
   type RecordOptions,
 } from "./src/recorder";
 import path from "path";
@@ -51,6 +53,7 @@ app.post("/api/record", requireSecret, async (req, res) => {
       waitUntil: req.body.waitUntil,
       extraWaitMs: req.body.extraWaitMs,
       songUrl: req.body.songUrl,
+      primaryAudioRole: req.body?.primaryAudioRole === "narration" ? "narration" : "music",
       musicUrl: typeof req.body?.musicUrl === "string" ? req.body.musicUrl : undefined,
       outWidth: typeof req.body?.outWidth === "number" ? req.body.outWidth : undefined,
       outHeight: typeof req.body?.outHeight === "number" ? req.body.outHeight : undefined,
@@ -119,6 +122,72 @@ app.delete("/api/record/:id", requireSecret, async (req, res) => {
   } catch (error) {
     console.error("[worker] Error deleting job:", error);
     res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+// ── POST /api/stills — capture vessel page beats as base64 PNG frames ─────
+// The bot's /slides carousel path calls this when the bot container has no
+// local Chromium. This worker HAS Chromium and already drives vessel pages
+// beat-by-beat for MP4 recording — the same pipeline screenshots each beat
+// and returns the frames as base64 data URLs, no disk writes.
+app.post("/api/stills", requireSecret, async (req, res) => {
+  try {
+    const url = typeof req.body?.url === "string" ? req.body.url.trim() : "";
+    if (!url) return res.status(400).json({ error: "url is required" });
+    if (!/^https?:\/\//i.test(url)) return res.status(400).json({ error: "url must be a public http(s) URL" });
+
+    const { chromium, devices } = await import("playwright-core");
+    const vp = { width: 540, height: 960 };
+    const browser = await chromium.launch({
+      headless: true,
+      executablePath: resolveChromium(),
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+    });
+    try {
+      const ctx = await browser.newContext({
+        ...devices["iPhone 14"],
+        viewport: vp,
+        deviceScaleFactor: 2,
+        reducedMotion: "reduce" as const,
+      });
+      const page = await ctx.newPage();
+      const pageUrl = new URL(url);
+      pageUrl.searchParams.set("mode", "frame");
+      await page.goto(pageUrl.toString(), { waitUntil: "load", timeout: 30_000 }).catch(() => {});
+      await page.evaluate(() => (document as any).fonts?.ready).catch(() => {});
+      await page.waitForFunction(() => (window as any).__vessel?.ready === true, { timeout: 10_000 }).catch(() => {});
+
+      const pageInfo = await collectPageInfo(page);
+      if (pageInfo.beatCount < 1) {
+        return res.status(422).json({ error: "No beats found on page — not a vessel slideshow" });
+      }
+      const msgCount = pageInfo.hasLanding
+        ? Math.max(0, pageInfo.vesselBeatCount - pageInfo.beatCount - 1)
+        : 0;
+      const ctaFrame = pageInfo.beatCount + msgCount + 1;
+
+      const frames: Array<{ index: number; dataUrl: string }> = [];
+      for (let i = 0; i < pageInfo.beatCount; i++) {
+        const n = msgCount + 1 + i;
+        await page.evaluate((idx: number) => (window as any).__vessel?.setBeat(idx), n).catch(() => {});
+        await page.waitForTimeout(i === 0 ? 1400 : 1000);
+        const buf = await page.screenshot({ type: "png" });
+        frames.push({ index: i, dataUrl: `data:image/png;base64,${buf.toString("base64")}` });
+      }
+      await page.evaluate((idx: number) => (window as any).__vessel?.setBeat(idx), ctaFrame).catch(() => {});
+      await page.waitForTimeout(1000);
+      const ctaBuf = await page.screenshot({ type: "png" });
+      frames.push({ index: pageInfo.beatCount, dataUrl: `data:image/png;base64,${ctaBuf.toString("base64")}` });
+
+      await ctx.close().catch(() => {});
+      console.log(`[worker] stills captured: ${pageInfo.beatCount} beats → ${frames.length} frames from ${url.slice(0, 80)}`);
+      res.json({ beatCount: pageInfo.beatCount, slideCount: frames.length, frames });
+    } finally {
+      await browser.close().catch(() => {});
+    }
+  } catch (err) {
+    console.error("[worker] stills capture failed:", (err as Error).message);
+    res.status(500).json({ error: "stills capture failed" });
   }
 });
 
