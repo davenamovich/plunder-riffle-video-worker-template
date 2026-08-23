@@ -71,6 +71,8 @@ export interface RecordOptions {
   extraWaitMs?: number;
   /** Optional music/song to mix over the recording (matches plunder's songUrl). */
   songUrl?: string;
+  /** Role of the primary page/song audio. Narration is finite; music loops. */
+  primaryAudioRole?: "narration" | "music";
   /**
    * Second track: background music that DUCKS under the primary track
    * (narration). Falls back to the page's `<audio id="score">` element when
