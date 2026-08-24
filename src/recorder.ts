@@ -39,12 +39,11 @@
  *   - globalThis job registry survives hot reloads
  */
 import { spawn, spawnSync } from "child_process";
-import { mkdir, stat, unlink, readdir, writeFile, open } from "fs/promises";
+import { mkdir, stat, unlink, readdir, writeFile, open, rename, rm } from "fs/promises";
 import { existsSync, readdirSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { randomUUID } from "crypto";
-
 // === worker-only BEGIN: getEnv shim (bot imports { getEnv } from "../env") ===
 // Standalone worker has no ../env module — inline the same fail-open reader so
 // the engine below stays byte-identical to bot/src/lib/video/recorder.ts.
@@ -71,7 +70,7 @@ export interface RecordOptions {
   extraWaitMs?: number;
   /** Optional music/song to mix over the recording (matches plunder's songUrl). */
   songUrl?: string;
-  /** Role of the primary page/song audio. Narration is finite; music loops. */
+  /** Role of the primary page/song audio. Legacy callers default to music, which loops. */
   primaryAudioRole?: "narration" | "music";
   /**
    * Second track: background music that DUCKS under the primary track
@@ -372,7 +371,14 @@ function ffmpegTimeoutMs(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : 300_000;
 }
 
-function runFfmpeg(args: string[]): Promise<void> {
+/**
+ * Run ffmpeg to completion. Robust where child_process `exec` is not: spawn
+ * streams stderr through a ring buffer instead of the 1MB maxBuffer cap that
+ * kills long re-encodes (the Superhybrid stitch), and SIGKILLs after
+ * ffmpegTimeoutMs() so a wedged encode can't hang the caller forever.
+ * Rejects with the tail of stderr on a non-zero exit.
+ */
+export function runFfmpeg(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
     const ffmpeg = spawn(resolveFfmpeg(), args, {
       stdio: ["ignore", "pipe", "pipe"],
@@ -557,8 +563,10 @@ function buildCompositeFilter(
 
   if (background === "blur") {
     chains.push("[screen]split=2[src_bg][src_fg]");
+    // Downscale background to 270x480 first to make gblur 16x faster, then upscale back to outW:outH.
+    // Reducing sigma to 10 on the smaller canvas produces the same visual blur radius as sigma 40 on the full canvas.
     chains.push(
-      `[src_bg]scale=${outW}:${outH}:force_original_aspect_ratio=increase,crop=${outW}:${outH},gblur=sigma=40,eq=brightness=-0.3[bg]`,
+      `[src_bg]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,gblur=sigma=10,eq=brightness=-0.3,scale=${outW}:${outH}[bg]`,
     );
     chains.push(`[src_fg]scale=${scaledW}:${targetH},setsar=1[fg]`);
     chains.push(`[bg][fg]overlay=${x}:${margin}:format=auto[ovr]`);
@@ -857,7 +865,20 @@ const SCROLL_DRIVER_SRC = `async (cfg) => {
         window.__slideshowDone === true ||
         Date.now() - startMs >= cfg.totalMs;
 
-  if (maxScroll <= 0) {
+  // Self-animating (interactive) pages must NEVER be scrolled, even when
+  // maxScroll is a small positive number. Slideshow/whiteboard/story layouts
+  // routinely overflow body by a few px (full-bleed beats, caption overlays),
+  // and previously that was enough to send the driver into the scroll branch
+  // below: it ramps window.scrollTo(0, y) up to that small maxScroll over
+  // SCROLL_PX_PER_SEC, which is exactly the "first frame moves down like
+  // auto-scroll and becomes off-centered" bug — the recording starts
+  // centered, visibly nudges down a few px right after the intro hold, then
+  // sits shifted for the rest of the show once y clamps at maxScroll. The
+  // isInteractive flag used to only change the isDone()/exit condition below,
+  // not whether to scroll at all, so it didn't prevent this. Treat any
+  // self-animating page the same as a genuinely non-scrollable one: just wait
+  // the show out.
+  if (maxScroll <= 0 || cfg.isInteractive) {
     while (!isDone()) {
       await sleep(200);
     }
@@ -949,6 +970,12 @@ export interface PageInfoForRecording {
   recordDurationMs: number;
   /** Whether the page is interactive and the scroll driver should wait for it */
   isInteractive?: boolean;
+  /** AppSlides fast path: the page exposes __vessel.appslides + setBeat. */
+  appslidesVessel: boolean;
+  /** CTA slide hold duration (ms) — appslides keeps its CTA on screen longer. */
+  ctaMs: number;
+  /** 0-indexed position of the CTA slide within the beat sequence. */
+  ctaIndex: number;
 }
 
 export async function collectPageInfo(page: any): Promise<PageInfoForRecording> {
@@ -1005,6 +1032,9 @@ export async function collectPageInfo(page: any): Promise<PageInfoForRecording> 
         audioDurationSec,
         recordDurationMs: Number(vessel.recordDurationMs) || 0,
         isInteractive: vessel.isInteractive === true,
+        appslidesVessel: vesselHook.appslides === true,
+        ctaMs: Number(vessel.ctaMs) || 0,
+        ctaIndex: Number.isFinite(Number(vessel.ctaIndex)) ? Number(vessel.ctaIndex) : -1,
       };
     })
     .catch(() => ({
@@ -1019,7 +1049,292 @@ export async function collectPageInfo(page: any): Promise<PageInfoForRecording> 
       audioDurationSec: 0,
       recordDurationMs: 0,
       isInteractive: false,
+      appslidesVessel: false,
+      ctaMs: 0,
+      ctaIndex: -1,
     }));
+}
+
+// AppSlides fast path (faster-than-realtime) — appslides is a deck of static
+// full-bleed slides (no hyperframes, no chat animation), so it can be rendered
+// by screenshotting each settled slide and crossfading the stills instead of
+// recording the page playing out in real time. This is the one format where the
+// screenshot approach is safe; the legacy Vessel path was removed (8c36199)
+// because it broke live recording for the animated formats, so this stays
+// scoped to appslides only (pageInfo.appslidesVessel).
+
+const APPSLIDE_OUTRO_SEC = 1.5; // matches app-slideshow-html.ts OUTRO_MS (final-slide hold)
+
+async function captureAppSlidesFrames(
+  browser: any,
+  pageUrl: string,
+  opts: RecordOptions,
+  beatCount: number,
+  dir: string,
+): Promise<string[]> {
+  const vp = VIEWPORTS[opts.viewport || "vertical"];
+  const { devices } = await import("playwright-core");
+  const ctx = await browser.newContext({
+    ...devices["iPhone 14"],
+    viewport: { width: vp.width, height: vp.height },
+    deviceScaleFactor: SUPERSAMPLE,
+    reducedMotion: "reduce" as const,
+  });
+  const page = await ctx.newPage();
+
+  const url = new URL(pageUrl);
+  url.searchParams.set("mode", "frame");
+  try {
+    await page.goto(url.toString(), { waitUntil: opts.waitUntil || "load", timeout: 30_000 });
+  } catch (err: any) {
+    console.warn(`[recorder] appslides capture goto warning: ${err?.message ?? err}`);
+  }
+
+  // Fonts must settle before the first screenshot, then wait for the hook.
+  try {
+    await page.evaluate(() => (document as any).fonts?.ready).catch(() => {});
+  } catch {}
+  try {
+    await page.waitForFunction(() => (window as any).__vessel?.ready === true, {
+      timeout: 10_000,
+    });
+  } catch {}
+
+  const paths: string[] = [];
+  for (let n = 0; n < beatCount; n++) {
+    await page
+      .evaluate((idx: number) => {
+        const v = (window as any).__vessel;
+        if (v && typeof v.setBeat === "function") v.setBeat(idx);
+      }, n)
+      .catch(() => {});
+    await page.waitForTimeout(n === 0 ? 1800 : 350);
+    // JPEG, not PNG: ffmpeg 8.x's PNG decoder intermittently fails with
+    // "inflate returned error -3" on looped still inputs; JPEG decode is solid
+    // and the slight loss is invisible after the x264 pass.
+    const p = join(dir, `appslide-${n}.jpg`);
+    await page.screenshot({ path: p, type: "jpeg", quality: 95 });
+    paths.push(p);
+  }
+
+  await ctx.close().catch(() => {});
+  return paths;
+}
+
+/**
+ * Wait for the currently-visible beat/CTA screen to actually be paint-ready
+ * before a still is captured: every <img> and CSS background-image inside it
+ * loaded, and any CSS animation running on it (the beat fade-in, the
+ * hyperframe burst/flash) has finished. Bounded by maxMs so a broken/404
+ * image can never hang the capture — it just falls through to whatever
+ * state the page is in once the deadline passes, same as the old blind
+ * timeout did every time.
+ *
+ * This replaces a fixed page.waitForTimeout() that assumed a beat's assets
+ * were always ready well inside the window. They aren't guaranteed to be:
+ * background-image on an element inside a display:none ancestor isn't
+ * fetched by the browser until that ancestor becomes visible, so a beat's
+ * gif only starts downloading the moment setBeat() reveals it — a genuine
+ * network fetch racing a fixed 1000ms clock. Waiting for real readiness
+ * instead of guessing a duration is what actually fixes an intermittent
+ * black/half-loaded frame, whichever beat it happens to land on.
+ */
+async function waitForBeatReady(page: any, maxMs: number): Promise<void> {
+  await page
+    .evaluate(async (maxWaitMs: number) => {
+      function visibleRoot(): Element {
+        const beats = document.querySelectorAll(".beat");
+        for (let i = 0; i < beats.length; i++) {
+          const b = beats[i] as HTMLElement;
+          if (getComputedStyle(b).display !== "none") return b;
+        }
+        const cta = document.querySelector("#cta-screen.active");
+        return cta || document.body;
+      }
+      const root = visibleRoot();
+      const waits: Promise<unknown>[] = [];
+
+      root.querySelectorAll("img").forEach((img) => {
+        const el = img as HTMLImageElement;
+        if (!el.complete) {
+          waits.push(new Promise((res) => { el.onload = res; el.onerror = res; }));
+        }
+      });
+
+      root.querySelectorAll("*").forEach((el) => {
+        const bg = getComputedStyle(el as Element).backgroundImage;
+        const m = bg && /url\(["']?(.*?)["']?\)/.exec(bg);
+        const src = m && m[1];
+        if (src) {
+          const probe = new Image();
+          waits.push(new Promise((res) => { probe.onload = res; probe.onerror = res; probe.src = src; }));
+        }
+      });
+
+      if (typeof (document as any).getAnimations === "function") {
+        for (const anim of (document as any).getAnimations() as any[]) {
+          const target = anim.effect && anim.effect.target;
+          if (target && root.contains(target)) {
+            waits.push((anim.finished as Promise<unknown>).catch(() => {}));
+          }
+        }
+      }
+
+      const deadline = new Promise((res) => setTimeout(res, maxWaitMs));
+      await Promise.race([Promise.all(waits), deadline]);
+      // One extra rAF round-trip so the browser has actually painted
+      // whatever just finished loading/animating before we screenshot.
+      await new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)));
+    }, maxMs)
+    .catch(() => {});
+}
+
+/**
+ * Screenshot each content beat + the CTA screen of a viral-framework /
+ * hybrid-slideshow page as static PNGs, for TikTok/Instagram photo-carousel
+ * posting (postSlideshowCarousel in ../slideshow-carousel-post.ts). Mirrors
+ * captureAppSlidesFrames's setBeat()-driven approach but:
+ *   - returns Buffers (no ffmpeg downstream, no temp files, PNG not JPEG)
+ *   - waits for each beat's images/animations to actually settle (see
+ *     waitForBeatReady) instead of a fixed guess — these pages have real
+ *     CSS entrance animations and lazily-fetched background gifs that
+ *     captureAppSlidesFrames's target file does not
+ *   - derives msgCount/CTA index itself from collectPageInfo() so callers
+ *     never have to know the beat-index math
+ *
+ * v1 is local-chromium only (same as captureAppSlidesFrames's own scope) —
+ * callers should gate on getRecorderHealth().chromiumFound first and fall
+ * back to the normal MP4 path when it's false (Browserless/external-only
+ * deployments). Wiring Browserless support here would require importing
+ * browserlessConfig from ../video/browserless, which itself imports FROM
+ * this file — a circular import — so that's left as a future follow-up.
+ */
+export async function captureSlideshowStillFrames(
+  pageUrl: string,
+  opts: { viewport?: { width: number; height: number } } = {},
+): Promise<Buffer[]> {
+  const { chromium, devices } = await import("playwright-core");
+  const vp = opts.viewport || { width: 540, height: 960 }; // ×2 supersample = 1080×1920, matches appslides output
+  const browser = await chromium.launch({
+    headless: true,
+    executablePath: resolveChromium(),
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+  });
+  try {
+    const ctx = await browser.newContext({
+      ...devices["iPhone 14"],
+      viewport: vp,
+      deviceScaleFactor: SUPERSAMPLE,
+      reducedMotion: "reduce" as const,
+    });
+    const page = await ctx.newPage();
+    const url = new URL(pageUrl);
+    url.searchParams.set("mode", "frame");
+    await page.goto(url.toString(), { waitUntil: "load", timeout: 30_000 }).catch(() => {});
+    await page.evaluate(() => (document as any).fonts?.ready).catch(() => {});
+    await page
+      .waitForFunction(() => (window as any).__vessel?.ready === true, { timeout: 10_000 })
+      .catch(() => {});
+
+    const pageInfo = await collectPageInfo(page);
+    if (pageInfo.beatCount < 1) throw new Error("Slideshow capture: no beats found on page");
+    // hasLanding is only true for hybrid pages with a leading iMessage
+    // conversation; msgCount is not a direct field on PageInfoForRecording
+    // but is exactly derivable from the two counts collectPageInfo does
+    // expose (see the doc comment on PageInfoForRecording.vesselBeatCount).
+    const msgCount = pageInfo.hasLanding
+      ? Math.max(0, pageInfo.vesselBeatCount - pageInfo.beatCount - 1)
+      : 0;
+    const ctaFrame = pageInfo.beatCount + msgCount + 1;
+
+    const frames: Buffer[] = [];
+    for (let i = 0; i < pageInfo.beatCount; i++) {
+      // __vessel.setBeat()'s index contract only applies the
+      // "msgCount+1" message/link-card offset on hybrid pages
+      // (isHybrid && msgCount > 0 in ralph/slideshow-html.ts — the exact
+      // condition mirrored by pageInfo.hasLanding here). Plain (non-hybrid)
+      // Viral Framework pages map setBeat(n) straight to beat index n, so
+      // applying the hybrid +1 offset there shifted every capture forward
+      // by one beat: beat 0 (the hook) was never screenshotted, and the
+      // last iteration asked for an out-of-range beat index, which
+      // showBeat() renders as all-beats-hidden — a solid black frame at a
+      // fixed, deterministic position in every non-hybrid carousel.
+      const n = pageInfo.hasLanding ? msgCount + 1 + i : i;
+      await page.evaluate((idx: number) => (window as any).__vessel?.setBeat(idx), n).catch(() => {});
+      // These pages fade each beat in via real CSS animation and lazily
+      // fetch each beat's background gif the instant it becomes visible
+      // (unlike app-slideshow-html.ts, which captureAppSlidesFrames's fixed
+      // 350ms wait is tuned for) — wait for actual readiness, bounded by a
+      // generous ceiling, instead of guessing a fixed duration.
+      await waitForBeatReady(page, i === 0 ? 2400 : 1800);
+      frames.push(await page.screenshot({ type: "jpeg", quality: 95 }));
+    }
+    await page
+      .evaluate((idx: number) => (window as any).__vessel?.setBeat(idx), ctaFrame)
+      .catch(() => {});
+    await waitForBeatReady(page, 1800);
+    frames.push(await page.screenshot({ type: "jpeg", quality: 95 })); // CTA slide, last
+
+    await ctx.close().catch(() => {});
+    return frames;
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
+
+async function assembleAppSlidesVideo(
+  frames: string[],
+  durationsSec: number[],
+  outPath: string,
+  outW: number,
+  outH: number,
+): Promise<number> {
+  const n = frames.length;
+  if (n < 1) throw new Error("assembleAppSlidesVideo: need >= 1 frame");
+  const T = TRANSITION_SEC;
+
+  const args: string[] = ["-y"];
+  for (const f of frames) args.push("-loop", "1", "-framerate", String(FPS), "-i", f);
+
+  const parts: string[] = [];
+  for (let i = 0; i < n; i++) {
+    parts.push(
+      `[${i}:v]trim=duration=${durationsSec[i].toFixed(3)},setpts=PTS-STARTPTS,` +
+        `scale=${outW}:${outH}:force_original_aspect_ratio=increase,crop=${outW}:${outH},` +
+        `setsar=1,fps=${FPS}[v${i}]`,
+    );
+  }
+
+  let prev = "[v0]";
+  let finalLabel = "[v0]";
+  let acc = 0;
+  for (let k = 1; k < n; k++) {
+    acc += durationsSec[k - 1];
+    const offset = (acc - k * T).toFixed(3);
+    const out = k === n - 1 ? "[vout]" : `[x${k}]`;
+    parts.push(`${prev}[v${k}]xfade=transition=fade:duration=${T}:offset=${offset}${out}`);
+    prev = out;
+    finalLabel = out;
+  }
+
+  // Outro: clone the final slide for APPSLIDE_OUTRO_SEC so the tail matches the
+  // live deck's OUTRO_MS (the page holds the last slide a beat longer).
+  parts.push(
+    `${finalLabel}tpad=stop_duration=${APPSLIDE_OUTRO_SEC.toFixed(3)}:stop_mode=clone[vfinal]`,
+  );
+  finalLabel = "[vfinal]";
+
+  const total = durationsSec.reduce((s, d) => s + d, 0) - (n - 1) * T + APPSLIDE_OUTRO_SEC;
+
+  args.push("-filter_complex", parts.join(";"));
+  args.push("-map", finalLabel);
+  args.push(
+    "-c:v", "libx264", "-profile:v", "high", "-level", "4.0", "-preset", "medium",
+    "-crf", "19", "-pix_fmt", "yuv420p", "-r", String(FPS), "-g", String(FPS * 2),
+    "-movflags", "+faststart", "-t", total.toFixed(3), outPath,
+  );
+  await runFfmpeg(args);
+  return total;
 }
 
 /**
@@ -1152,12 +1467,16 @@ export interface ScreencastTrimResult {
  * recorder's timing is unit-testable without ffmpeg.
  *
  *  - INTERACTIVE pages (audio-driven Story Mode, slideshows that animate
- *    themselves): trim EXACTLY at the stamped show start and hold nothing.
- *    The legacy path applied a 6.5s `tpad` clone of the webm's FIRST frame
- *    (the pre-render blank) then trimmed past the show start with a blind
- *    +1.5s hack — the clone pushed real content 6.5s later while the mixed
- *    audio ran from t=0, which is the blank-opening / narration-out-of-sync
- *    bug.
+ *    themselves): trim EXACTLY at the stamped show start. Pages that carry a
+ *    separately-mixed narration track (`hasVoice`) hold NOTHING — a `tpad`
+ *    clone of the first frame shifts the video later while the narration
+ *    still runs from t=0, so the voice drifts ~1.5s ahead of the scenes.
+ *    Silent beat-driven pages keep a short 1.5s hold so the opening frame
+ *    never shows an animation/font-load glitch. The legacy path applied a
+ *    6.5s `tpad` clone of the webm's FIRST frame (the pre-render blank) then
+ *    trimmed past the show start with a blind +1.5s hack — the clone pushed
+ *    real content 6.5s later while the mixed audio ran from t=0, which is
+ *    the blank-opening / narration-out-of-sync bug.
  *  - STATIC pages (scrolled blog posts): legacy behavior — blind trim past
  *    the lead + a held first frame for a stable poster.
  */
@@ -1167,6 +1486,10 @@ export function computeScreencastTrim(input: {
   durationMs: number;
   videoLenSec: number | null;
   isInteractive: boolean;
+  /** True when the page's narration is mixed in as a separate track (Story
+   *  Mode's <audio id="bgm">). Suppresses the opening frame hold so the
+   *  video and the narration stay in lock-step. */
+  hasVoice?: boolean;
 }): ScreencastTrimResult {
   const totalRecordedSec = Math.max(0.5, input.showEndMs / 1000);
   const videoLenSec = input.videoLenSec ?? totalRecordedSec;
@@ -1183,7 +1506,10 @@ export function computeScreencastTrim(input: {
     const maxAvailableSec = Math.max(0.5, videoLenSec - startSec);
     return {
       startSec,
-      holdSec: 0,
+      // Narration is mixed separately at t=0, so a held opening frame would
+      // leave the voice running ~1.5s ahead of the visuals. Only silent
+      // beat-driven pages get the glitch-free hold.
+      holdSec: input.hasVoice ? 0 : 1.5,
       showDurSec: Math.min(targetDurSec, maxAvailableSec),
       // Poster moment after the entrance fade so the thumbnail isn't a dark
       // just-started frame (the page's title fades in over ~0.65s).
@@ -1225,6 +1551,8 @@ export interface ComposeScreencastInput {
   audioPath?: string | null;
   /** Background music track (ducked under audioPath). */
   musicPath?: string | null;
+  /** Role of audioPath: narration is finite; music/song remains loopable. */
+  primaryAudioRole?: "narration" | "music";
   /** True when the webm already starts on the settled show (Browserless
    *  starts recording after navigation + settle) — no white lead to guard. */
   cleanLead?: boolean;
@@ -1266,8 +1594,11 @@ export function buildAudioMixFilter(o: {
   musicVolume?: number;
   voiceTailSec: number;
   fadeDurSec: number;
+  /** Whether the primary [1:a] track should repeat to fill the video. */
+  primaryAudioLoops?: boolean;
 }): string | null {
   const dur = o.showDurSec;
+  const primaryLoop = o.primaryAudioLoops === false ? "" : ",aloop=loop=-1:size=2e9";
   const voiceTail = Math.max(0, dur - o.voiceTailSec);
   const voiceVol = o.audioVolume > 0 ? o.audioVolume : 1.0;
   const musicVol = o.musicVolume ?? 0.16;
@@ -1280,17 +1611,44 @@ export function buildAudioMixFilter(o: {
     // The voice label feeds BOTH the sidechain compressor and the final amix.
     // This ffmpeg build rejects a reused label as a second input, so the
     // voice is duplicated with asplit — the sidechain only DIPS the bed.
-    const voice = `[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=0:${voiceTail.toFixed(3)},volume=${voiceVol.toFixed(2)},afade=t=out:st=${Math.max(0, voiceTail - o.fadeDurSec).toFixed(2)}:d=${o.fadeDurSec},apad,atrim=0:${dur.toFixed(3)},asplit=2[voice][voice2]`;
+    const voice = `[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo${primaryLoop},atrim=0:${voiceTail.toFixed(3)},volume=${voiceVol.toFixed(2)},afade=t=out:st=${Math.max(0, voiceTail - o.fadeDurSec).toFixed(2)}:d=${o.fadeDurSec},apad,atrim=0:${dur.toFixed(3)},asplit=2[voice][voice2]`;
     return `${voice};${musicChain}[music];[music][voice]sidechaincompress=threshold=0.04:ratio=12:attack=30:release=350[duck];[duck][voice2]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[aout]`;
   }
   if (o.hasMusic) {
     return `${musicChain},alimiter=limit=0.95[aout]`;
   }
-  // Legacy single-track paths — byte-for-byte unchanged behavior.
+  // Single-track voice path. The narration plays ONCE (no `aloop` — looping
+  // it made a story's opening repeat during the silent outro tail), then
+  // apad fills the rest with silence. The autoDuration variant keeps the
+  // legacy plain-apad chain.
   if (o.autoDuration) {
-    return `[1:a]aresample=44100,apad,atrim=0:${dur.toFixed(3)},alimiter=limit=0.95[aout]`;
+    return `[1:a]aresample=44100${primaryLoop},apad,atrim=0:${dur.toFixed(3)},alimiter=limit=0.95[aout]`;
   }
-  return `[1:a]aresample=44100,atrim=0:${voiceTail.toFixed(3)},volume=${voiceVol.toFixed(2)},afade=t=out:st=${Math.max(0, voiceTail - o.fadeDurSec).toFixed(2)}:d=${o.fadeDurSec},apad,atrim=0:${dur.toFixed(3)},alimiter=limit=0.95[aout]`;
+  return `[1:a]aresample=44100${primaryLoop},atrim=0:${voiceTail.toFixed(3)},volume=${voiceVol.toFixed(2)},afade=t=out:st=${Math.max(0, voiceTail - o.fadeDurSec).toFixed(2)}:d=${o.fadeDurSec},apad,atrim=0:${dur.toFixed(3)},alimiter=limit=0.95[aout]`;
+}
+
+/**
+ * ffmpeg args for the AppSlides fast path's single-track audio mix.
+ * Pure so the loop decision is unit-testable without ffmpeg.
+ *
+ * Music loops (`-stream_loop -1`) to fill a video longer than the track;
+ * narration plays ONCE — looping it would repeat a story's opening during
+ * the silent outro, the same bug the screencast path guards against.
+ */
+export function buildAppSlidesAudioMix(opts: {
+  videoDurSec: number;
+  primaryAudioRole?: "narration" | "music";
+  audioVolume?: number;
+}): { inputArgs: string[]; filter: string } {
+  const { videoDurSec } = opts;
+  const loopPrimary = opts.primaryAudioRole !== "narration";
+  const audioVol = opts.audioVolume ?? 0.5;
+  return {
+    inputArgs: loopPrimary ? ["-stream_loop", "-1"] : [],
+    filter:
+      `[1:a]aresample=44100,atrim=0:${videoDurSec.toFixed(3)},volume=${audioVol.toFixed(2)},` +
+      `afade=t=out:st=${Math.max(0, videoDurSec - 1.2).toFixed(2)}:d=1.2,alimiter=limit=0.95[aout]`,
+  };
 }
 
 /**
@@ -1324,20 +1682,23 @@ export async function composeScreencastToMp4(
 
   // Where the file starts, how long the opening frame is held, and the
   // poster-frame moment. Interactive pages (story/audio-driven) trim exactly
-  // at the stamped show start with NO frame hold so narration and visuals stay
-  // in sync; static pages keep the legacy lead-trim + poster hold.
+  // at the stamped show start; audio-driven pages get NO frame hold so the
+  // separately-mixed narration stays in sync; silent beat-driven pages keep a
+  // short 1.5s hold. Static pages keep the legacy lead-trim + poster hold.
   const trim = computeScreencastTrim({
     showStartMs,
     showEndMs,
     durationMs,
     videoLenSec: probedSec,
     isInteractive: input.isInteractive === true,
+    hasVoice: !!audioPath && input.primaryAudioRole === "narration",
   });
   const { startSec, holdSec, showDurSec, thumbSec } = trim;
 
-  // Interactive pages get holdSec=0 (see computeScreencastTrim) to protect
-  // narration sync, but the trimmed frame 0 still ships as this file's own
-  // poster frame — pass noFade so it doesn't fade up from black regardless.
+  // Audio-driven interactive pages get holdSec=0 (see computeScreencastTrim)
+  // to protect narration sync, but the trimmed frame 0 still ships as this
+  // file's own poster frame — pass noFade so it doesn't fade up from black
+  // regardless.
   const filter = buildCompositeFilter(
     background,
     viewport.width,
@@ -1361,6 +1722,7 @@ export async function composeScreencastToMp4(
     showDurSec,
     audioVolume,
     musicVolume,
+    primaryAudioLoops: input.primaryAudioRole !== "narration",
     voiceTailSec,
     fadeDurSec,
   });
@@ -1377,13 +1739,25 @@ export async function composeScreencastToMp4(
     : ["-ss", startSec.toFixed(3), "-t", showDurSec.toFixed(3)];
 
   const anyAudio = audioPath || musicPath;
+
+  // Encode codec — CPU libx264 by default. Set FFMPEG_ENCODER=h264_nvenc (or
+  // hevc_nvenc) to use an NVIDIA GPU encoder; requires GPU passthrough into
+  // the container (nvidia-container-toolkit) or ffmpeg will fail to launch.
+  const encoder = process.env.FFMPEG_ENCODER || "libx264";
+  const nvenc = encoder === "h264_nvenc" || encoder === "hevc_nvenc";
+  const videoCodecArgs = nvenc
+    ? ["-c:v", encoder, "-preset", "p4", "-cq", "23", "-rc", "vbr", "-b:v", "0"]
+    : ["-c:v", "libx264", "-preset", "fast", "-crf", "23"];
+
   const finalArgs = [
     "-y",
     ...inputSeekArgs,
     "-i",
     webmPath,
-    // Narration is a single-play track; apad supplies silence after it ends.
-    // Only the optional music bed is looped below.
+    // Narration is NOT looped — it plays once and apad fills the tail with
+    // silence. Looping it (the old `-stream_loop -1`) made a story's opening
+    // repeat during the silent outro. The music bed is the only track that
+    // loops.
     ...(audioPath ? ["-i", audioPath] : []),
     ...(musicPath ? ["-stream_loop", "-1", "-i", musicPath] : []),
     "-filter_complex",
@@ -1392,12 +1766,7 @@ export async function composeScreencastToMp4(
     "[out]",
     ...(audioFilter ? ["-map", "[aout]"] : []),
     ...outputTrimArgs,
-    "-c:v",
-    "libx264",
-    "-preset",
-    "fast",
-    "-crf",
-    "23",
+    ...videoCodecArgs,
     "-pix_fmt",
     "yuv420p",
     "-movflags",
@@ -1524,6 +1893,69 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
       `${id}-music`,
     );
 
+    // APPSLIDES FAST PATH (faster-than-realtime). appslides is a deck of static
+    // full-bleed slides, so screenshot each settled slide and crossfade the
+    // stills instead of recording the page playing out in real time. Scoped to
+    // appslides only; the animated formats keep the live screencast below.
+    if (pageInfo.appslidesVessel && pageInfo.beatCount >= 1) {
+      console.log(`[recorder] AppSlides fast path — ${pageInfo.beatCount} slides`);
+      await page.close().catch(() => {});
+      await context.close().catch(() => {});
+
+      const outWidth = opts.outWidth || VERTICAL_OUT_W;
+      const outHeight = opts.outHeight || VERTICAL_OUT_H;
+      const beatCount = pageInfo.beatCount;
+      const ctaIndex = pageInfo.ctaIndex >= 0 ? pageInfo.ctaIndex : -1;
+      const slideMs = Math.max(1200, pageInfo.beatMs || DEFAULT_BEAT_MS);
+      const ctaMs = Math.max(1200, pageInfo.ctaMs || slideMs);
+
+      const frames = await captureAppSlidesFrames(browser, opts.url, opts, beatCount, workDir);
+      if (frames.length < 1) throw new Error("AppSlides capture produced no frames");
+
+      const durations = frames.map((_, i) => (i === ctaIndex ? ctaMs : slideMs) / 1000);
+      const videoDurSec = await assembleAppSlidesVideo(frames, durations, mp4Path, outWidth, outHeight);
+
+      // Mix the optional song if one was passed. Music loops to fill the
+      // video; narration (should there ever be any here) plays once, exactly
+      // like the screencast path (see buildAppSlidesAudioMix).
+      if (audioPath) {
+        const mixedPath = join(workDir, "appslides-mixed.mp4");
+        const mix = buildAppSlidesAudioMix({
+          videoDurSec,
+          primaryAudioRole: opts.primaryAudioRole,
+          audioVolume: opts.audioVolume,
+        });
+        await runFfmpeg([
+          "-y",
+          "-i", mp4Path,
+          ...mix.inputArgs,
+          "-i", audioPath as string,
+          "-filter_complex", mix.filter,
+          "-map", "0:v", "-map", "[aout]",
+          "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+          "-movflags", "+faststart", mixedPath,
+        ]);
+        await rename(mixedPath, mp4Path);
+      }
+
+      await assertMp4Healthy(mp4Path);
+      const thumb = await makeThumbnail(mp4Path, thumbPath, 0.45);
+      const mp4Stat = await stat(mp4Path);
+      return {
+        id,
+        mp4Path,
+        mp4Url: `${baseUrl}/api/record/${id}/download`,
+        thumbnailPath: thumb,
+        thumbnailUrl: thumb ? `${baseUrl}/api/record/${id}/thumbnail` : undefined,
+        mp4SizeBytes: mp4Stat.size,
+        durationMs: Math.round(videoDurSec * 1000),
+        success: true,
+        output: { width: outWidth, height: outHeight, aspectRatio },
+        frameColor: "none",
+        viewport: { width: viewport.width, height: viewport.height, name: viewport.name },
+      };
+    }
+
 
 
     // ΓöÇΓöÇ SCREENCAST PATH ΓöÇΓöÇ
@@ -1603,7 +2035,15 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
       background,
       audioPath,
       musicPath,
-      isInteractive: pageInfo.beatCount > 0 || pageInfo.vesselBeatCount > 0,
+      primaryAudioRole: opts.primaryAudioRole,
+      // Must match the `isInteractive` computed above for drivePageForRecording
+      // (line ~1821) — this was missing `|| pageInfo.isInteractive`, so a
+      // self-animating page with no discrete .beat DOM (e.g. whiteboard scenes)
+      // was driven as interactive during recording but composed with the
+      // legacy STATIC trim math (blind lead-trim + 6.5s hold), landing the
+      // held opening frame on the wrong point in the webm.
+      isInteractive:
+        pageInfo.beatCount > 0 || pageInfo.vesselBeatCount > 0 || pageInfo.isInteractive,
       autoDuration,
       outWidth,
       outHeight,
@@ -1983,5 +2423,20 @@ export async function deleteOldRecordings(
   } catch {
     /* directory missing ΓÇö nothing to clean */
   }
+  try {
+    const tDir = tmpdir();
+    const tEntries = await readdir(tDir, { withFileTypes: true });
+    for (const entry of tEntries) {
+      if (!entry.isDirectory() || !entry.name.startsWith('rec-')) continue;
+      const dirPath = join(tDir, entry.name);
+      try {
+        const s = await stat(dirPath);
+        if (s.mtimeMs < cutoff) {
+          await rm(dirPath, { recursive: true, force: true });
+        }
+      } catch {}
+    }
+  } catch {}
+
   return removed;
 }
