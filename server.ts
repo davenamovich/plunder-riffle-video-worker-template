@@ -10,9 +10,62 @@ import {
 } from "./src/recorder";
 import path from "path";
 import fs from "fs";
+import { publishMp4ToHereNow, mediaUrlFor } from "./src/herenow";
+
+function isValidPublicUrl(u: string): boolean {
+  try {
+    if (u.length > 2048) return false;
+    const parsed = new URL(u);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+    const host = parsed.hostname.toLowerCase();
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return false;
+    if (host.startsWith('192.168.') || host.startsWith('10.') || host.match(/^172\.(1[6-9]|2[0-9]|3[0-1])\./)) return false;
+    if (host === '169.254.169.254') return false;
+    if (host.endsWith('.internal') || host.endsWith('.railway.internal')) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 const app = express();
 app.use(express.json({ limit: "100mb" }));
+
+// ── here.now publish-on-completion ───────────────────────────────────────────
+// Finished renders are published to here.now so the bot hands the user a
+// durable link instead of a transient Railway /download URL. The publish
+// state lives HERE (server layer), not in the engine — src/recorder.ts is
+// sync-guarded against bot/src/lib/video/recorder.ts and must stay untouched.
+//
+// The bot forwards its own here.now API key (or the user's) in the POST body;
+// per-job keys are kept in `herenowKeys`. Without any key the publish is
+// anonymous (page expires ~24h) — the worker's HERENOW_API_KEY env var is
+// the fallback for authenticated (permanent) publishes.
+const herenowKeys = new Map<string, string>(); // jobId → here.now API key from the render request
+const publishState = new Map<string, { started: boolean; url?: string }>();
+
+/**
+ * Publish a finished job's MP4 to here.now exactly once. Safe to call from
+ * every status poll: in-flight publishes are skipped, and a failed publish
+ * clears `started` so the next poll retries.
+ */
+async function ensurePublished(jobId: string): Promise<void> {
+  const st = publishState.get(jobId);
+  if (st?.url || st?.started) return;
+  const job = getJob(jobId);
+  if (!job || job.status !== "done" || !job.result?.mp4Path) return;
+  publishState.set(jobId, { started: true });
+  try {
+    const apiKey = herenowKeys.get(jobId) || process.env["HERENOW_API_KEY"] || undefined;
+    const res = await publishMp4ToHereNow(job.result.mp4Path, { apiKey });
+    publishState.set(jobId, { started: false, url: res.url });
+    herenowKeys.delete(jobId);
+    console.log(`[worker] published ${jobId} to here.now: ${res.url} (${res.authMode})`);
+  } catch (err) {
+    console.error(`[worker] here.now publish failed for ${jobId}:`, (err as Error).message);
+    publishState.delete(jobId); // retry on the next status poll
+  }
+}
 
 // ── Auth guard ──────────────────────────────────────────────────────────────
 // The bot sends `x-operator-secret: <TELEGRAM_WEBHOOK_SECRET>` on every render
@@ -43,6 +96,9 @@ app.post("/api/record", requireSecret, async (req, res) => {
     if (!url || typeof url !== "string") {
       return res.status(400).json({ error: "Missing 'url' parameter" });
     }
+    if (!isValidPublicUrl(url)) {
+      return res.status(400).json({ error: "Invalid, internal, or unsupported URL" });
+    }
     const opts: RecordOptions = {
       url,
       durationMs: typeof req.body.durationMs === "number" ? req.body.durationMs : undefined,
@@ -63,6 +119,9 @@ app.post("/api/record", requireSecret, async (req, res) => {
     };
     console.log(`[worker] Starting recording for ${url}`);
     const job = await startRecordingJob(opts);
+    if (typeof req.body?.herenowApiKey === "string" && req.body.herenowApiKey.trim()) {
+      herenowKeys.set(job.id, req.body.herenowApiKey.trim());
+    }
     // Both shapes the bot's client accepts (data.job.id / data.id).
     res.json({ id: job.id, job });
   } catch (error) {
@@ -78,15 +137,26 @@ app.get("/api/record/:id", requireSecret, (req, res) => {
   if (!job) {
     return res.status(404).json({ error: "Job not found" });
   }
+  const payload: any = { ...job };
   if (job.status === "done" && job.result) {
     const host = req.get("host");
     const protocol = req.protocol;
-    job.result.mp4Url = `${protocol}://${host}/api/record/${job.id}/download`;
-    job.result.thumbnailUrl = job.result.thumbnailPath
+    payload.result = { ...job.result };
+    payload.result.mp4Url = `${protocol}://${host}/api/record/${job.id}/download`;
+    payload.result.thumbnailUrl = payload.result.thumbnailPath
       ? `${protocol}://${host}/api/record/${job.id}/thumbnail`
       : undefined;
+    // Publish to here.now (idempotent) and surface the durable link. The bot's
+    // recorder client reads data.result.url as hereNowUrl and prefers it over
+    // the transient /download URL.
+    void ensurePublished(job.id);
+    const url = publishState.get(job.id)?.url;
+    if (url) {
+      payload.result.url = url;
+      payload.result.mediaUrl = mediaUrlFor(url);
+    }
   }
-  res.json(job);
+  res.json(payload);
 });
 
 // Download the finished MP4. The bot's external client constructs this exact
