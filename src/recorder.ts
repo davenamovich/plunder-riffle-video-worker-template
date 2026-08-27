@@ -398,10 +398,6 @@ export function runFfmpeg(args: string[]): Promise<void> {
     });
     ffmpeg.on("close", (code) => {
       clearTimeout(killer);
-      if (timedOut) {
-        return reject(new Error(`FFmpeg killed after ${Math.round(limitMs / 1000)}s (timeout)`));
-      }
-      if (code === 0) return resolve();
       const fullStderr = Buffer.concat(stderrChunks).toString();
       if (process.env.DEBUG_FFMPEG) {
         try {
@@ -412,6 +408,15 @@ export function runFfmpeg(args: string[]): Promise<void> {
           console.log(`[recorder] full stderr dumped to ${dump}`);
         } catch {}
       }
+      if (timedOut) {
+        const tail = fullStderr.slice(-1500);
+        return reject(
+          new Error(
+            `FFmpeg killed after ${Math.round(limitMs / 1000)}s (timeout)${tail ? ` — last stderr: ${tail}` : " — no stderr output before kill"}`,
+          ),
+        );
+      }
+      if (code === 0) return resolve();
       const stderr = fullStderr.slice(-3000);
       reject(new Error(`FFmpeg exited ${code}: ${stderr}`));
     });
@@ -613,7 +618,12 @@ function runFfmpegCapture(args: string[]): Promise<Buffer> {
     ffmpeg.on("close", (code) => {
       clearTimeout(killer);
       if (timedOut) {
-        return reject(new Error(`FFmpeg killed after ${Math.round(limitMs / 1000)}s (timeout)`));
+        const tail = Buffer.concat(errChunks).toString().slice(-1500);
+        return reject(
+          new Error(
+            `FFmpeg killed after ${Math.round(limitMs / 1000)}s (timeout)${tail ? ` — last stderr: ${tail}` : " — no stderr output before kill"}`,
+          ),
+        );
       }
       if (code === 0) return resolve(Buffer.concat(out));
       reject(new Error(`FFmpeg exited ${code}: ${Buffer.concat(errChunks).toString().slice(-1500)}`));
@@ -992,10 +1002,14 @@ export async function collectPageInfo(page: any): Promise<PageInfoForRecording> 
       const vessel = (window as any).VESSEL || {};
       const vesselHook = (window as any).__vessel || {};
       const anyAudio = document.querySelector("audio") as HTMLAudioElement | null;
+      // Clip Hybrid heroes carry the source clip in a <video> (mp4 uploads) —
+      // its audio track is the show's sound and must be mixed into the MP4.
+      const clipVideo = document.getElementById("clipvideo") as HTMLVideoElement | null;
       const audioSrc =
         document.getElementById("bgm")?.getAttribute("src") ||
         document.getElementById("bedSrc")?.getAttribute("src") ||
-        (anyAudio ? anyAudio.currentSrc || anyAudio.getAttribute("src") : null);
+        (anyAudio ? anyAudio.currentSrc || anyAudio.getAttribute("src") : null) ||
+        (clipVideo ? clipVideo.currentSrc || clipVideo.getAttribute("src") : null);
       // Story Mode's music bed — played under the narration on the page, and
       // mixed (ducked) into the MP4 by the recorder.
       const musicSrc =
