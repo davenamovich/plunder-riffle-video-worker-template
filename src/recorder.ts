@@ -1083,7 +1083,7 @@ async function captureAppSlidesFrames(
   beatCount: number,
   dir: string,
 ): Promise<string[]> {
-  const vp = VIEWPORTS[opts.viewport || "vertical"];
+  const vp = viewportDims((opts.viewport || "vertical") as ViewportPreset);
   const { devices } = await import("playwright-core");
   const ctx = await browser.newContext({
     ...devices["iPhone 14"],
@@ -1836,7 +1836,7 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
   const mp4Path = join(RECORDINGS_DIR, `${id}.mp4`);
   const thumbPath = join(RECORDINGS_DIR, `${id}-thumb.jpg`);
 
-  const viewport = VIEWPORTS[opts.viewport || "vertical"];
+  const viewport = viewportDims((opts.viewport || "vertical") as ViewportPreset);
   const background = opts.background || "blur";
   const aspectRatio = opts.aspectRatio || "9:16";
   const autoDuration = opts.autoDuration !== false;
