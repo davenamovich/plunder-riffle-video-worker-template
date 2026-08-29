@@ -4,6 +4,7 @@ import {
   getJob,
   deleteJob,
   recorderDiagnostics,
+  getRenderQueueStatus,
   resolveChromium,
   collectPageInfo,
   type RecordOptions,
@@ -42,12 +43,14 @@ app.use(express.json({ limit: "100mb" }));
 // anonymous (page expires ~24h) — the worker's HERENOW_API_KEY env var is
 // the fallback for authenticated (permanent) publishes.
 const herenowKeys = new Map<string, string>(); // jobId → here.now API key from the render request
+const herenowLanguages = new Map<string, string>(); // jobId → language from the render request
 const publishState = new Map<string, { started: boolean; url?: string }>();
 
 /**
- * Publish a finished job's MP4 to here.now exactly once. Safe to call from
- * every status poll: in-flight publishes are skipped, and a failed publish
- * clears `started` so the next poll retries.
+ * Publish a finished job's MP4 to here.now exactly once. Await it before
+ * responding to a status poll so the durable link is ready in the response.
+ * Safe to call from every status poll: in-flight publishes are skipped, and
+ * a failed publish clears `started` so the next poll retries.
  */
 async function ensurePublished(jobId: string): Promise<void> {
   const st = publishState.get(jobId);
@@ -57,9 +60,18 @@ async function ensurePublished(jobId: string): Promise<void> {
   publishState.set(jobId, { started: true });
   try {
     const apiKey = herenowKeys.get(jobId) || process.env["HERENOW_API_KEY"] || undefined;
-    const res = await publishMp4ToHereNow(job.result.mp4Path, { apiKey });
+    const language = herenowLanguages.get(jobId);
+    const res = await publishMp4ToHereNow(job.result.mp4Path, { apiKey, language });
+    // The job may have been deleted mid-publish — don't re-add a stale entry.
+    if (!getJob(jobId)) {
+      console.log(`[worker] published ${jobId} to here.now but job was deleted: ${res.url}`);
+      herenowKeys.delete(jobId);
+      herenowLanguages.delete(jobId);
+      return;
+    }
     publishState.set(jobId, { started: false, url: res.url });
     herenowKeys.delete(jobId);
+    herenowLanguages.delete(jobId);
     console.log(`[worker] published ${jobId} to here.now: ${res.url} (${res.authMode})`);
   } catch (err) {
     console.error(`[worker] here.now publish failed for ${jobId}:`, (err as Error).message);
@@ -122,6 +134,9 @@ app.post("/api/record", requireSecret, async (req, res) => {
     if (typeof req.body?.herenowApiKey === "string" && req.body.herenowApiKey.trim()) {
       herenowKeys.set(job.id, req.body.herenowApiKey.trim());
     }
+    if (typeof req.body?.language === "string" && req.body.language.trim()) {
+      herenowLanguages.set(job.id, req.body.language.trim());
+    }
     // Both shapes the bot's client accepts (data.job.id / data.id).
     res.json({ id: job.id, job });
   } catch (error) {
@@ -132,7 +147,7 @@ app.post("/api/record", requireSecret, async (req, res) => {
 
 // Check job status — returns the JobRecord the bot's client reads straight
 // off the body (status/message/error/result).
-app.get("/api/record/:id", requireSecret, (req, res) => {
+app.get("/api/record/:id", requireSecret, async (req, res) => {
   const job = getJob(req.params.id);
   if (!job) {
     return res.status(404).json({ error: "Job not found" });
@@ -146,10 +161,13 @@ app.get("/api/record/:id", requireSecret, (req, res) => {
     payload.result.thumbnailUrl = payload.result.thumbnailPath
       ? `${protocol}://${host}/api/record/${job.id}/thumbnail`
       : undefined;
-    // Publish to here.now (idempotent) and surface the durable link. The bot's
-    // recorder client reads data.result.url as hereNowUrl and prefers it over
-    // the transient /download URL.
-    void ensurePublished(job.id);
+    // Publish to here.now and wait for it so the durable link is ready in
+    // THIS response — the bot returns on its first done poll, so a fire-and-
+    // forget publish would always lose that race and the bot would re-publish
+    // from its own side (double upload). Idempotent: later polls short-circuit
+    // on the stored URL. The bot's recorder client reads data.result.url as
+    // hereNowUrl and prefers it over the transient /download URL.
+    await ensurePublished(job.id);
     const url = publishState.get(job.id)?.url;
     if (url) {
       payload.result.url = url;
@@ -188,6 +206,11 @@ app.get("/api/record/:id/thumbnail", (req, res) => {
 app.delete("/api/record/:id", requireSecret, async (req, res) => {
   try {
     await deleteJob(req.params.id);
+    // Job is gone — drop its here.now publish state and per-job API key so
+    // the maps don't accumulate entries for transient jobs.
+    publishState.delete(req.params.id);
+    herenowKeys.delete(req.params.id);
+    herenowLanguages.delete(req.params.id);
     res.json({ success: true });
   } catch (error) {
     console.error("[worker] Error deleting job:", error);
@@ -270,7 +293,26 @@ app.get("/health", async (_req, res) => {
   } catch (error) {
     console.warn("[worker] health diagnostic failed:", (error as Error).message);
   }
-  res.json({ status: "ok", service: "video-worker", recorder });
+  // Flat fields consumed by the bot's ops daemon (bot/src/lib/ops-daemon.ts).
+  // Without them every worker rendered as "0 running, browser not ready" on
+  // the /ops dashboard regardless of what it was actually doing.
+  const queue = getRenderQueueStatus();
+  res.json({
+    status: "ok",
+    service: "video-worker",
+    replicaId:
+      process.env["RAILWAY_REPLICA_ID"] ||
+      process.env["RAILWAY_DEPLOYMENT_ID"] ||
+      require("os").hostname(),
+    uptimeSeconds: Math.round(process.uptime()),
+    running: queue.running,
+    queued: queue.queued,
+    capacity: queue.capacity,
+    browser: recorder?.chromium?.found ? "ok" : "missing",
+    ffmpeg: recorder?.ffmpeg?.found ? "ok" : "missing",
+    queue,
+    recorder,
+  });
 });
 
 const port = Number(process.env.PORT) || 3000;

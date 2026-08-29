@@ -115,11 +115,24 @@ async function publishToHereNow(
  */
 export async function publishMp4ToHereNow(
   mp4Path: string,
-  opts: { title?: string; apiKey?: string } = {},
+  opts: { title?: string; apiKey?: string; language?: string } = {},
 ): Promise<HereNowPublishResult> {
   const mp4 = await readFile(mp4Path);
   const title = opts.title || "MP4 Video";
   const safeTitle = title.replace(/[<>&"]/g, "");
+  
+  let tapText = '🔊 Tap for Sound';
+  let dlText = 'Download Video';
+  const lang = (opts.language || 'English').toLowerCase();
+  if (lang === 'chinese') { tapText = '🔊 点击开启声音'; dlText = '下载视频'; }
+  else if (lang === 'spanish') { tapText = '🔊 Toca para escuchar'; dlText = 'Descargar Video'; }
+  else if (lang === 'french') { tapText = '🔊 Toucher pour le son'; dlText = 'Télécharger la vidéo'; }
+  else if (lang === 'german') { tapText = '🔊 Tippen für Ton'; dlText = 'Video herunterladen'; }
+  else if (lang === 'japanese') { tapText = '🔊 タップして音声をオン'; dlText = '動画をダウンロード'; }
+  else if (lang === 'korean') { tapText = '🔊 탭하여 소리 켜기'; dlText = '동영상 다운로드'; }
+  else if (lang === 'portuguese') { tapText = '🔊 Toque para ouvir'; dlText = 'Baixar Vídeo'; }
+  else if (lang === 'russian') { tapText = '🔊 Нажмите для звука'; dlText = 'Скачать видео'; }
+
   // The page URL isn't known until after publish, so we use a relative path for
   // og:video. Telegram's crawler resolves relative URLs from the page origin.
   const html = `<!doctype html>
@@ -141,17 +154,68 @@ export async function publishMp4ToHereNow(
 <meta name="twitter:player:width" content="1080">
 <meta name="twitter:player:height" content="1920">
 <style>
-  html,body{margin:0;background:#000;height:100%;display:flex;align-items:center;justify-content:center}
+  html,body{margin:0;background:#000;height:100%;display:flex;align-items:center;justify-content:center;overflow:hidden;font-family:sans-serif;}
   body{padding:12px;box-sizing:border-box}
-  video{max-width:100%;max-height:92vh;border-radius:18px;background:#111;box-shadow:0 12px 40px rgba(0,0,0,.5)}
+  .video-container { position: relative; max-width: 100%; max-height: 92vh; border-radius: 18px; box-shadow: 0 12px 40px rgba(0,0,0,.5); overflow: hidden; background:#111; }
+  video{ width: 100%; height: 100%; display: block; }
+  
+  .overlay { 
+    position: absolute; inset: 0; background: rgba(0,0,0,0.4); display: flex; 
+    align-items: center; justify-content: center; opacity: 0; transition: opacity 0.2s ease;
+    pointer-events: none; z-index: 10;
+  }
+  .overlay.active { opacity: 1; pointer-events: auto; }
+  
+  .download-btn {
+    background: #fff; color: #000; text-decoration: none; padding: 14px 28px; 
+    border-radius: 30px; font-weight: bold; font-size: 16px;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.3); transform: translateY(10px);
+    transition: transform 0.2s ease, background 0.2s ease;
+  }
+  .overlay.active .download-btn { transform: translateY(0); }
+  .download-btn:active { background: #eee; transform: scale(0.96); }
+
+  .sound-btn {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.5); color: #fff; font-size: 1.2rem; font-weight: bold; cursor: pointer;
+    z-index: 20; transition: opacity 0.3s;
+  }
 </style>
-</head>
 <body>
-<video src="ralph.mp4" poster="poster.jpg" controls autoplay muted loop playsinline></video>
+<div class="video-container" id="vc">
+  <div class="sound-btn" id="soundBtn">${tapText}</div>
+  <video src="ralph.mp4" poster="poster.jpg" playsinline loop muted autoplay></video>
+  <div class="overlay" id="overlay">
+    <a href="ralph.mp4" download class="download-btn" id="dl">${dlText}</a>
+  </div>
+</div>
 <script>
-  // Unmute after the first user interaction so autoplay works everywhere.
-  const v = document.querySelector('video');
-  document.addEventListener('click', () => { v.muted = false; }, { once: true });
+  const vc = document.getElementById('vc');
+  const overlay = document.getElementById('overlay');
+  const vid = vc.querySelector('video');
+  const soundBtn = document.getElementById('soundBtn');
+  
+  let hasInteracted = false;
+
+  // Unmute and hide sound button on first tap
+  soundBtn.addEventListener('click', (e) => {
+    e.stopPropagation(); // prevent toggling the download overlay immediately
+    vid.muted = false;
+    vid.play();
+    soundBtn.style.opacity = '0';
+    setTimeout(() => soundBtn.style.display = 'none', 300);
+    hasInteracted = true;
+    vid.controls = true; // reveal native controls after they unlock audio
+  });
+  
+  // Toggle overlay on subsequent clicks (only if unlocked via ?dl=1)
+  vc.addEventListener('click', (e) => {
+    if (!hasInteracted) return;
+    if (e.target.id === 'dl') return;
+    const params = new URLSearchParams(window.location.search);
+    if (!params.has('dl') && !params.has('download')) return;
+    overlay.classList.toggle('active');
+  });
 </script>
 </body>
 </html>`;

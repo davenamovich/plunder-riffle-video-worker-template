@@ -44,6 +44,7 @@ import { existsSync, readdirSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { randomUUID } from "crypto";
+import { publishMp4ToHereNow } from "./herenow.js";
 // === worker-only BEGIN: getEnv shim (bot imports { getEnv } from "../env") ===
 // Standalone worker has no ../env module — inline the same fail-open reader so
 // the engine below stays byte-identical to bot/src/lib/video/recorder.ts.
@@ -70,6 +71,8 @@ export interface RecordOptions {
   extraWaitMs?: number;
   /** Optional music/song to mix over the recording (matches plunder's songUrl). */
   songUrl?: string;
+  /** Language for the here.now page */
+  language?: string;
   /** Role of the primary page/song audio. Legacy callers default to music, which loops. */
   primaryAudioRole?: "narration" | "music";
   /**
@@ -97,6 +100,9 @@ export interface RecordOptions {
    *  Defaults to 0.16 — well under the narration, dipped further by the
    *  sidechain whenever the voice is present. */
   musicVolume?: number;
+  /** here.now API key passed by the bot to allow direct-upload publishing
+   *  of the final MP4. */
+  herenowApiKey?: string;
   /** Per-job watchdog override (defaults to jobTimeoutMs()). 5–6 min story
    *  renders need more than the 8-minute default once capture + encode are
    *  counted. */
@@ -398,6 +404,10 @@ export function runFfmpeg(args: string[]): Promise<void> {
     });
     ffmpeg.on("close", (code) => {
       clearTimeout(killer);
+      if (timedOut) {
+        return reject(new Error(`FFmpeg killed after ${Math.round(limitMs / 1000)}s (timeout)`));
+      }
+      if (code === 0) return resolve();
       const fullStderr = Buffer.concat(stderrChunks).toString();
       if (process.env.DEBUG_FFMPEG) {
         try {
@@ -408,15 +418,6 @@ export function runFfmpeg(args: string[]): Promise<void> {
           console.log(`[recorder] full stderr dumped to ${dump}`);
         } catch {}
       }
-      if (timedOut) {
-        const tail = fullStderr.slice(-1500);
-        return reject(
-          new Error(
-            `FFmpeg killed after ${Math.round(limitMs / 1000)}s (timeout)${tail ? ` — last stderr: ${tail}` : " — no stderr output before kill"}`,
-          ),
-        );
-      }
-      if (code === 0) return resolve();
       const stderr = fullStderr.slice(-3000);
       reject(new Error(`FFmpeg exited ${code}: ${stderr}`));
     });
@@ -618,12 +619,7 @@ function runFfmpegCapture(args: string[]): Promise<Buffer> {
     ffmpeg.on("close", (code) => {
       clearTimeout(killer);
       if (timedOut) {
-        const tail = Buffer.concat(errChunks).toString().slice(-1500);
-        return reject(
-          new Error(
-            `FFmpeg killed after ${Math.round(limitMs / 1000)}s (timeout)${tail ? ` — last stderr: ${tail}` : " — no stderr output before kill"}`,
-          ),
-        );
+        return reject(new Error(`FFmpeg killed after ${Math.round(limitMs / 1000)}s (timeout)`));
       }
       if (code === 0) return resolve(Buffer.concat(out));
       reject(new Error(`FFmpeg exited ${code}: ${Buffer.concat(errChunks).toString().slice(-1500)}`));
@@ -821,8 +817,9 @@ export async function resolveAudioForMix(
       await writeFile(target, Buffer.from(m[2], "base64"));
       return target;
     }
-    const abs = new URL(src, pageUrl).toString();
-    const res = await fetch(abs);
+      const safePageUrl = pageUrl.endsWith("/") ? pageUrl : pageUrl + "/";
+      const abs = new URL(src, safePageUrl).toString();
+      const res = await fetch(abs);
     if (!res.ok) return null;
     const buf = Buffer.from(await res.arrayBuffer());
     if (buf.length === 0) return null;
@@ -2126,7 +2123,7 @@ function updateQueuePositions(): void {
   });
 }
 
-function acquireJobSlot(id: string): Promise<void> {
+export function acquireJobSlot(id: string): Promise<void> {
   if (runningJobsCount < MAX_CONCURRENT_JOBS) {
     runningJobsCount++;
     return Promise.resolve();
@@ -2137,7 +2134,7 @@ function acquireJobSlot(id: string): Promise<void> {
   });
 }
 
-function releaseJobSlot(): void {
+export function releaseJobSlot(): void {
   const next = jobQueue.shift();
   if (next) {
     // Hand the slot straight over — runningJobsCount stays as it is.
@@ -2153,6 +2150,15 @@ function releaseJobSlot(): void {
 /** Live queue depth — surfaced by /api/record so the UI can show the backlog. */
 export function getRenderQueueStatus(): { running: number; queued: number; capacity: number } {
   return { running: runningJobsCount, queued: jobQueue.length, capacity: MAX_CONCURRENT_JOBS };
+}
+
+let isShuttingDown = false;
+export function setShuttingDown() {
+  isShuttingDown = true;
+}
+
+export function isWorkerShuttingDown() {
+  return isShuttingDown;
 }
 
 async function probeDuration(p: string): Promise<number | null> {
