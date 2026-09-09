@@ -1043,7 +1043,13 @@ export async function collectPageInfo(page: any): Promise<PageInfoForRecording> 
         audioDurationSec,
         recordDurationMs: Number(vessel.recordDurationMs) || 0,
         isInteractive: vessel.isInteractive === true,
-        appslidesVessel: vesselHook.appslides === true,
+        appslidesVessel:
+          vesselHook.appslides === true &&
+          !document.getElementById("transmission-screen") &&
+          !document.querySelector(".beat") &&
+          !document.querySelector("video") &&
+          !document.documentElement.innerHTML.includes(".gif") &&
+          !document.documentElement.innerHTML.includes("giphy.com"),
         ctaMs: Number(vessel.ctaMs) || 0,
         ctaIndex: Number.isFinite(Number(vessel.ctaIndex)) ? Number(vessel.ctaIndex) : -1,
       };
@@ -1859,6 +1865,7 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
   try {
     const context = await browser.newContext({
       ...devices["iPhone 14"],
+      screen: { width: viewport.width, height: viewport.height },
       viewport: { width: viewport.width, height: viewport.height },
       recordVideo: { dir: workDir, size: { width: viewport.width, height: viewport.height } },
     });
