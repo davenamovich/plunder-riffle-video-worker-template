@@ -1857,6 +1857,7 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
       "--disable-gpu",
+      "--mute-audio",
       "--autoplay-policy=no-user-gesture-required",
       "--font-render-hinting=none",
     ],
