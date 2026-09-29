@@ -44,7 +44,7 @@ import { existsSync, readdirSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { randomUUID } from "crypto";
-import { publishMp4ToHereNow } from "./herenow.js";
+
 // === worker-only BEGIN: getEnv shim (bot imports { getEnv } from "../env") ===
 // Standalone worker has no ../env module — inline the same fail-open reader so
 // the engine below stays byte-identical to bot/src/lib/video/recorder.ts.
@@ -67,12 +67,11 @@ export interface RecordOptions {
   viewport?: ViewportPreset;
   aspectRatio?: AspectRatio;
   background?: BackgroundStyle;
+  herenowApiKey?: string;
   waitUntil?: "load" | "domcontentloaded" | "networkidle";
   extraWaitMs?: number;
   /** Optional music/song to mix over the recording (matches plunder's songUrl). */
   songUrl?: string;
-  /** Language for the here.now page */
-  language?: string;
   /** Role of the primary page/song audio. Legacy callers default to music, which loops. */
   primaryAudioRole?: "narration" | "music";
   /**
@@ -100,13 +99,20 @@ export interface RecordOptions {
    *  Defaults to 0.16 — well under the narration, dipped further by the
    *  sidechain whenever the voice is present. */
   musicVolume?: number;
-  /** here.now API key passed by the bot to allow direct-upload publishing
-   *  of the final MP4. */
-  herenowApiKey?: string;
   /** Per-job watchdog override (defaults to jobTimeoutMs()). 5–6 min story
    *  renders need more than the 8-minute default once capture + encode are
    *  counted. */
   timeoutMs?: number;
+  /**
+   * Third audio layer: short SFX clips laid under the mix at fixed offsets
+   * (Story Mode's per-scene cinematic entrance sounds — see story/sfx.ts).
+   * Each `path` is a LOCAL file already on this machine (the caller writes
+   * the clip to a temp file before starting the job); `atSec` is seconds
+   * from the start of the show. Self-hosted screencast path only — see
+   * composeScreencastToMp4/buildAudioMixFilter. Absent or empty leaves the
+   * existing voice+music mix completely unchanged.
+   */
+  sfxCues?: Array<{ path: string; atSec: number; volume?: number }>;
 }
 
 export interface RecordResult {
@@ -140,7 +146,7 @@ export interface JobRecord {
 
 // ΓöÇΓöÇ Constants ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
-const RECORDINGS_DIR = join(process.cwd(), "download", "recordings");
+const RECORDINGS_DIR = join(tmpdir(), "recordings");
 
 export function recordingsDir(): string {
   return RECORDINGS_DIR;
@@ -207,7 +213,10 @@ const WHITE_GUARD_MS = 1500;
  * held the white for longer. `leadSec` is now verified against the actual
  * pixels first (see `findCleanTrimSec`), so the hold is safe to re-enable.
  */
-const HOLD_FIRST_FRAME_MS = 6500;const POST_ROLL_MS = 2200; // cut 2s from end to remove white — small tail kept after the show when trimming
+// Reduced from 6500 → 2000ms: still long enough for a stable poster frame,
+// but saves 4.5s off every output video and encode time.
+const HOLD_FIRST_FRAME_MS = 2000;
+const POST_ROLL_MS = 2200; // cut 2s from end to remove white — small tail kept after the show when trimming
 /**
  * Ceiling for AUTO-computed durations (3 min). Story Mode passes an explicit
  * durationMs (measured from the narration audio, up to ~6 min), which bypasses
@@ -220,6 +229,49 @@ function autoLenCapMs(): number {
 }
 /** Hard ceiling for EXPLICIT durations — sanity guard only (15 min). */
 const EXPLICIT_DURATION_CAP_MS = 900_000;
+
+// ── Static-card fast path (single-page memes) ─────────────────────────────
+// Single-meme pages (single-meme-html.ts) are ONE settled composition — no
+// .beat/.card DOM, VESSEL.beats=1, no audio — so playing them out via the
+// screencast path burns 6s of real-time Chromium capture to film a still.
+// Instead: screenshot the settled frame once (supersampled, like the AppSlides
+// path) and let ffmpeg hold it for the target duration with a fade-in and a
+// fade-out. Sub-second render, deterministic, no scroll driver involved.
+
+/** Target video length for a static card. Override with RECORD_STATIC_CARD_MS (bounded 3–60s). */
+export function staticCardDurationMs(): number {
+  const raw = Number(getEnv("RECORD_STATIC_CARD_MS"));
+  return Math.min(60_000, Math.max(3_000, Number.isFinite(raw) && raw > 0 ? raw : 10_000));
+}
+/** Opening fade-in — long enough to feel intentional, short enough to leave a clean poster frame. */
+const STATIC_CARD_FADE_IN_SEC = 0;
+/** Closing fade-out (slightly longer than the fade-in, mirrored feel). */
+const STATIC_CARD_FADE_OUT_SEC = 0;
+
+/**
+ * Does this page qualify for the static-card fast path? Pure + exported so
+ * the gate stays unit-testable.
+ *
+ * Criteria: the page declares itself a single settled composition (VESSEL
+ * beats=1 / recordDurationMs baked) AND actually has zero beat/card DOM (a
+ * miscount must not hijack real decks) AND has no audio (a page with sound
+ * needs the screencast path's audio mix) AND the caller isn't overlaying a
+ * song/narration (same reason).
+ */
+export function isStaticCardPage(
+  pageInfo: PageInfoForRecording,
+  opts: { hasMixAudio?: boolean } = {},
+): boolean {
+  if (opts.hasMixAudio) return false;
+  if (pageInfo.appslidesVessel) return false;
+  if (pageInfo.audioSrc || pageInfo.musicSrc || pageInfo.audioDurationSec > 0) return false;
+  // An explicit multi-beat declaration is authoritative — never fast-path it.
+  if (pageInfo.declaredBeats > 1) return false;
+  const declaredSingle =
+    pageInfo.declaredBeats === 1 ||
+    (pageInfo.declaredBeats === 0 && pageInfo.recordDurationMs > 0 && pageInfo.beatCount === 0);
+  return declaredSingle && pageInfo.beatCount === 0 && pageInfo.vesselBeatCount <= 1 && !!pageInfo.hasVesselHook;
+}
 const DEFAULT_BEAT_MS = 5250; // FIXED: 5.25s per slide for all formats
 
 // The closing CTA screen (the final `__vessel.setBeat(beatCount)` state, per
@@ -404,10 +456,6 @@ export function runFfmpeg(args: string[]): Promise<void> {
     });
     ffmpeg.on("close", (code) => {
       clearTimeout(killer);
-      if (timedOut) {
-        return reject(new Error(`FFmpeg killed after ${Math.round(limitMs / 1000)}s (timeout)`));
-      }
-      if (code === 0) return resolve();
       const fullStderr = Buffer.concat(stderrChunks).toString();
       if (process.env.DEBUG_FFMPEG) {
         try {
@@ -418,6 +466,18 @@ export function runFfmpeg(args: string[]): Promise<void> {
           console.log(`[recorder] full stderr dumped to ${dump}`);
         } catch {}
       }
+      if (timedOut) {
+        // Tail of stderr at kill time — usually shows the last frame/time ffmpeg
+        // reported progress for, which is the difference between "genuinely too
+        // slow" and "wedged on frame 0 forever" when this is read back later.
+        const tail = fullStderr.slice(-1500);
+        return reject(
+          new Error(
+            `FFmpeg killed after ${Math.round(limitMs / 1000)}s (timeout)${tail ? ` — last stderr: ${tail}` : " — no stderr output before kill"}`,
+          ),
+        );
+      }
+      if (code === 0) return resolve();
       const stderr = fullStderr.slice(-3000);
       reject(new Error(`FFmpeg exited ${code}: ${stderr}`));
     });
@@ -619,7 +679,12 @@ function runFfmpegCapture(args: string[]): Promise<Buffer> {
     ffmpeg.on("close", (code) => {
       clearTimeout(killer);
       if (timedOut) {
-        return reject(new Error(`FFmpeg killed after ${Math.round(limitMs / 1000)}s (timeout)`));
+        const tail = Buffer.concat(errChunks).toString().slice(-1500);
+        return reject(
+          new Error(
+            `FFmpeg killed after ${Math.round(limitMs / 1000)}s (timeout)${tail ? ` — last stderr: ${tail}` : " — no stderr output before kill"}`,
+          ),
+        );
       }
       if (code === 0) return resolve(Buffer.concat(out));
       reject(new Error(`FFmpeg exited ${code}: ${Buffer.concat(errChunks).toString().slice(-1500)}`));
@@ -641,8 +706,8 @@ function runFfmpegCapture(args: string[]): Promise<Buffer> {
  * with text reads mean 216 / sd 63. Testing brightness on its own would throw
  * away the second one. The flatness test is what separates them.
  */
-const BLANK_MEAN_MIN = 235;
-const BLANK_SD_MAX = 6;
+const BLANK_MEAN_MIN = 240;
+const BLANK_SD_MAX = 3;
 
 /**
  * Mean + standard deviation of the frame at `atSec`, measured over the PHONE
@@ -659,18 +724,19 @@ async function frameStats(
   crop?: string,
 ): Promise<{ mean: number; sd: number } | null> {
   try {
-    // Decode ONE frame down to 8x8 greyscale raw bytes — 64 values to measure.
+    // Decode ONE frame down to 32x32 greyscale raw bytes — 1024 values to measure.
+    // No -ss at t=0: seeking a still image (static-card JPEG) yields zero
+    // frames, which would read as "not blank" and skip the re-capture.
     const raw = await runFfmpegCapture([
       "-v",
       "error",
-      "-ss",
-      atSec.toFixed(3),
+      ...(atSec > 0 ? ["-ss", atSec.toFixed(3)] : []),
       "-i",
       mp4Path,
       "-vframes",
       "1",
       "-vf",
-      crop ? `${crop},scale=8:8` : "scale=8:8",
+      crop ? `${crop},scale=32:32` : "scale=32:32",
       "-pix_fmt",
       "gray",
       "-f",
@@ -690,9 +756,10 @@ async function frameStats(
 }
 
 function isBlankFrame(s: { mean: number; sd: number }): boolean {
-  // A frame is blank if it is almost completely flat (uniform color), regardless of 
-  // whether it is white, grey, or black. 
-  return s.sd <= BLANK_SD_MAX;
+  // An unrendered blank frame (initial loading state) is BOTH very bright (mean >= 240)
+  // AND flat (sd < 3 across 32x32 grid). Real light-mode meme/iMessage pages have text & UI
+  // elements, giving sd > 8.
+  return s.mean >= BLANK_MEAN_MIN && s.sd <= BLANK_SD_MAX;
 }
 
 /**
@@ -716,7 +783,9 @@ async function findCleanTrimSec(
   baseSec: number,
   ceilingSec: number,
 ): Promise<number> {
-  const offsets = [0, 0.3, 0.6, 1.0, 1.5, 2.5];
+  // Capped at 3 probes (was 6) — the first clean frame is almost always
+  // within 0.6s of the base on a properly loaded page.
+  const offsets = [0, 0.3, 0.6];
   for (const off of offsets) {
     const t = baseSec + off;
     if (t >= ceilingSec) break;
@@ -750,7 +819,9 @@ async function makeThumbnail(
   crop?: string,
 ): Promise<string | undefined> {
   // Preferred moment first, then progressively deeper into the show.
-  const candidates = [preferSec, preferSec + 0.5, 1.5, 2.5, 4, 6];
+  // Capped at 3 candidates (was 6) — the first clean frame is nearly always
+  // within 1s of start; extra probes just add 6+ extra FFmpeg spawns.
+  const candidates = [preferSec, preferSec + 0.5, 2.0];
   let fallback: number | null = null;
 
   for (const t of candidates) {
@@ -817,9 +888,8 @@ export async function resolveAudioForMix(
       await writeFile(target, Buffer.from(m[2], "base64"));
       return target;
     }
-      const safePageUrl = pageUrl.endsWith("/") ? pageUrl : pageUrl + "/";
-      const abs = new URL(src, safePageUrl).toString();
-      const res = await fetch(abs);
+    const abs = new URL(src, pageUrl).toString();
+    const res = await fetch(abs);
     if (!res.ok) return null;
     const buf = Buffer.from(await res.arrayBuffer());
     if (buf.length === 0) return null;
@@ -1034,15 +1104,15 @@ export async function collectPageInfo(page: any): Promise<PageInfoForRecording> 
           slides.length,
         ),
         vesselBeatCount: vesselBeats + hybridMsgCount + (hybridMsgCount > 0 ? 1 : 0),
-        beatMs: Number(vessel.beatMs) || 0,
-        declaredBeats: Number(vessel.beats) || 0,
+        beatMs: Number(vessel.beatMs) || Number(vesselHook.beatMs) || 0,
+        declaredBeats: Number(vessel.beats) || Number(vesselHook.beats) || Number(vesselHook.beatCount) || 0,
         hasVesselHook: typeof vesselHook.setBeat === "function",
         hasLanding: vesselHook.hasLanding === true,
         audioSrc: audioSrc || null,
         musicSrc: musicSrc || null,
         audioDurationSec,
-        recordDurationMs: Number(vessel.recordDurationMs) || 0,
-        isInteractive: vessel.isInteractive === true,
+        recordDurationMs: Number(vessel.recordDurationMs) || Number(vesselHook.recordDurationMs) || 0,
+        isInteractive: vessel.isInteractive === true || vesselHook.isInteractive === true,
         appslidesVessel:
           vesselHook.appslides === true &&
           !document.getElementById("transmission-screen") &&
@@ -1089,7 +1159,7 @@ async function captureAppSlidesFrames(
   beatCount: number,
   dir: string,
 ): Promise<string[]> {
-  const vp = viewportDims((opts.viewport || "vertical") as ViewportPreset);
+  const vp = VIEWPORTS[opts.viewport || "vertical"];
   const { devices } = await import("playwright-core");
   const ctx = await browser.newContext({
     ...devices["iPhone 14"],
@@ -1159,6 +1229,10 @@ async function captureAppSlidesFrames(
 async function waitForBeatReady(page: any, maxMs: number): Promise<void> {
   await page
     .evaluate(async (maxWaitMs: number) => {
+      // Wait for the browser to apply styles and create CSS animations
+      // before we try to collect and await them.
+      await new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)));
+
       function visibleRoot(): Element {
         const beats = document.querySelectorAll(".beat");
         for (let i = 0; i < beats.length; i++) {
@@ -1235,7 +1309,7 @@ export async function captureSlideshowStillFrames(
   const browser = await chromium.launch({
     headless: true,
     executablePath: resolveChromium(),
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--mute-audio"],
   });
   try {
     const ctx = await browser.newContext({
@@ -1245,16 +1319,28 @@ export async function captureSlideshowStillFrames(
       reducedMotion: "reduce" as const,
     });
     const page = await ctx.newPage();
-    const url = new URL(pageUrl);
-    url.searchParams.set("mode", "frame");
-    await page.goto(url.toString(), { waitUntil: "load", timeout: 30_000 }).catch(() => {});
+    let targetGoto = pageUrl;
+    if (!pageUrl.startsWith("data:")) {
+      try {
+        const url = new URL(pageUrl);
+        url.searchParams.set("mode", "frame");
+        targetGoto = url.toString();
+      } catch {}
+    }
+    await page.goto(targetGoto, { waitUntil: "load", timeout: 30_000 }).catch(() => {});
     await page.evaluate(() => (document as any).fonts?.ready).catch(() => {});
     await page
       .waitForFunction(() => (window as any).__vessel?.ready === true, { timeout: 10_000 })
       .catch(() => {});
 
     const pageInfo = await collectPageInfo(page);
-    if (pageInfo.beatCount < 1) throw new Error("Slideshow capture: no beats found on page");
+    if (pageInfo.beatCount < 1) {
+      // Single-page rendering (e.g. single-meme format or standalone card)
+      await new Promise((res) => setTimeout(res, 800));
+      const singleFrame = await page.screenshot({ type: "jpeg", quality: 95 });
+      await ctx.close().catch(() => {});
+      return [singleFrame];
+    }
     // hasLanding is only true for hybrid pages with a leading iMessage
     // conversation; msgCount is not a direct field on PageInfoForRecording
     // but is exactly derivable from the two counts collectPageInfo does
@@ -1346,12 +1432,348 @@ async function assembleAppSlidesVideo(
   args.push("-filter_complex", parts.join(";"));
   args.push("-map", finalLabel);
   args.push(
-    "-c:v", "libx264", "-profile:v", "high", "-level", "4.0", "-preset", "medium",
-    "-crf", "19", "-pix_fmt", "yuv420p", "-r", String(FPS), "-g", String(FPS * 2),
+    "-c:v", "libx264", "-profile:v", "high", "-level", "4.0", "-preset", "fast",
+    "-crf", "28", "-pix_fmt", "yuv420p", "-r", String(FPS), "-g", String(FPS * 2),
+    "-threads", "0",
     "-movflags", "+faststart", "-t", total.toFixed(3), outPath,
   );
   await runFfmpeg(args);
   return total;
+}
+
+/**
+ * Capture ONE settled frame of a static-card page (single-page memes).
+ * Mirrors captureAppSlidesFrames: open at ?mode=frame (pages freeze entrance
+ * animations there), wait for fonts + the vessel hook, then screenshot JPEG
+ * (NOT PNG — ffmpeg 8.x's PNG decoder intermittently fails with "inflate
+ * returned error -3" on looped still inputs; JPEG decode is solid and the
+ * loss is invisible after the x264 pass). Supersampled via deviceScaleFactor
+ * so the downscale to output size stays crisp.
+ */
+interface StaticCardCapture {
+  /** Full settled frame (JPEG) — the still fallback. */
+  framePath: string;
+  /** Everything EXCEPT the meme media, on a transparent background (PNG). */
+  overlayPath?: string;
+  /** The meme's own media (GIF / video / image) and where it sits, in CSS px.
+   *  `bytes` is the media fetched server-side at capture time — the animated
+   *  path composites from these bytes, so a GIF the browser failed to paint
+   *  (slow multi-MB load, or a hard onerror) still ships as a real animated
+   *  meme instead of captions on a black card. */
+  media?: {
+    src: string;
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+    bytes?: Buffer;
+    contentType?: string;
+  };
+  /** Screenshot pixel size (viewport × SUPERSAMPLE). */
+  canvasW: number;
+  canvasH: number;
+}
+
+async function captureStaticCardFrame(
+  browser: any,
+  pageUrl: string,
+  opts: RecordOptions,
+  dir: string,
+): Promise<StaticCardCapture> {
+  const vp = VIEWPORTS[opts.viewport || "vertical"];
+  const { devices } = await import("playwright-core");
+  const ctx = await browser.newContext({
+    ...devices["iPhone 14"],
+    viewport: { width: vp.width, height: vp.height },
+    deviceScaleFactor: SUPERSAMPLE,
+    reducedMotion: "reduce" as const,
+  });
+  const page = await ctx.newPage();
+
+  const url = new URL(pageUrl);
+  url.searchParams.set("mode", "frame");
+  try {
+    await page.goto(url.toString(), { waitUntil: opts.waitUntil || "load", timeout: 30_000 });
+  } catch (err: any) {
+    console.warn(`[recorder] static-card capture goto warning: ${err?.message ?? err}`);
+  }
+
+  // Fonts must settle before the screenshot, then wait for the hook.
+  try {
+    await page.evaluate(() => (document as any).fonts?.ready).catch(() => {});
+  } catch {}
+  try {
+    await page.waitForFunction(() => (window as any).__vessel?.ready === true, { timeout: 10_000 });
+  } catch {}
+  // Drive the page to its final state (single-meme's setBeat just forces
+  // .meme-stage visible) and give images/animations a bounded settle window.
+  await page.evaluate(() => {
+    const v = (window as any).__vessel;
+    if (v && typeof v.setBeat === "function") v.setBeat(0);
+  }).catch(() => {});
+  await waitForBeatReady(page, 2500);
+
+  // Meme media readiness: the .meme-bg <img> is the whole point of the card.
+  // waitForBeatReady only waits for images that are still `loading` when it
+  // runs — a Giphy GIF that hasn't even STARTED (multi-MB on a cold edge) or
+  // one that hard-fires onerror slips through, and the card screenshots as
+  // captions on black. Probe it explicitly: read the INTENDED src off the
+  // attribute (survives onerror having hidden the element) and wait, bounded,
+  // for a real paint. A failed load is rescued server-side below — the bytes
+  // are fetched from Node where there is no browser deadline.
+  const mediaInfo = await page
+    .evaluate(() => {
+      const el = document.querySelector(".meme-bg") as HTMLImageElement | null;
+      if (!el) return null;
+      // The page's onerror sets display:none — re-show so the geometry read
+      // below still reflects where the media would sit (the stage rect).
+      if (getComputedStyle(el).display === "none") el.style.display = "block";
+      return {
+        src: el.getAttribute("src") || (el as any).currentSrc || "",
+        painted: el.complete && el.naturalWidth > 0,
+        failed: el.dataset.srcFailed === "1",
+      };
+    })
+    .catch(() => null);
+  if (mediaInfo && !mediaInfo.painted && !mediaInfo.failed) {
+    await page
+      .waitForFunction(
+        () => {
+          const el = document.querySelector(".meme-bg") as HTMLImageElement | null;
+          return !!el && el.complete && el.naturalWidth > 0;
+        },
+        { timeout: 8_000, polling: 250 },
+      )
+      .catch(() => {});
+  }
+
+  const p = join(dir, "static-card.jpg");
+  // Never hold a blank frame for 10s: if the meme image hasn't painted yet
+  // (flat white/near-white), give it more time and re-shoot.
+  for (let attempt = 0; attempt < 4; attempt++) {
+    await page.screenshot({ path: p, type: "jpeg", quality: 95 });
+    const st = await frameStats(p, 0).catch(() => null);
+    if (!st || !isBlankFrame(st)) break;
+    console.warn(`[recorder] static-card frame blank (mean ${st.mean}, sd ${st.sd.toFixed(1)}) — waiting and re-capturing`);
+    await page.waitForTimeout(1500).catch(() => {});
+  }
+
+  // Animated-meme layers: the meme media itself (so the MP4 can play the real
+  // GIF/video on a loop instead of a frozen screenshot) and the caption layer
+  // on a transparent background to composite on top of it.
+  const out: StaticCardCapture = {
+    framePath: p,
+    canvasW: vp.width * SUPERSAMPLE,
+    canvasH: vp.height * SUPERSAMPLE,
+  };
+  try {
+    if (mediaInfo && /^https?:/i.test(mediaInfo.src)) {
+      const rect = await page
+        .evaluate(() => {
+          const el = document.querySelector(".meme-bg") as HTMLImageElement | null;
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return { x: r.left, y: r.top, w: r.width, h: r.height };
+        })
+        .catch(() => null);
+      if (rect && rect.w >= 2 && rect.h >= 2) {
+        // Server-side fetch of the media bytes. This is what rescues the
+        // captions-on-black card: whatever happened in the browser (slow
+        // paint, onerror, 10s navigation deadline), Node fetches the same URL
+        // with a clean 20s budget. On success the animated path composites
+        // [dark bg] + [media bytes] + [overlay] and the still frame isn't
+        // even used.
+        try {
+          const res = await fetch(mediaInfo.src, { signal: AbortSignal.timeout(20_000) });
+          if (res.ok) {
+            out.media = {
+              src: mediaInfo.src,
+              ...rect,
+              bytes: Buffer.from(await res.arrayBuffer()),
+              contentType: (res.headers.get("content-type") || "").toLowerCase(),
+            };
+          }
+        } catch (err) {
+          console.warn(`[recorder] static-card media fetch failed: ${(err as Error).message}`);
+        }
+      }
+      if (out.media) {
+        // Make the overlay layer genuinely transparent: hide the media and
+        // clear every background INLINE with !important. A <style> tag (the
+        // previous approach) loses to the page's own
+        // `body.record-mode { background:#090a0c !important }` — same
+        // specificity, but the page's rule is a stylesheet rule an author
+        // sheet can't reliably beat by order — and the opaque dark card that
+        // resulted covered the GIF: captions on black AGAIN, this time even
+        // with the animated path running. Inline !important beats every
+        // author stylesheet rule.
+        // Make the overlay layer genuinely transparent: hide the media and
+        // clear every background INLINE with !important. A <style> tag (the
+        // previous approach) loses to the page's own
+        // `body.record-mode { background:#090a0c !important }` — same
+        // specificity, but the page's rule is a stylesheet rule an author
+        // sheet can't reliably beat by order — and the opaque dark card that
+        // resulted covered the GIF: captions on black AGAIN, this time even
+        // with the animated path running. Inline !important beats every
+        // author stylesheet rule.
+        //
+        // LANDMINE: this evaluate body must not contain NAMED inner arrow
+        // bindings (`const f = (…) => …`). Under tsx/esbuild keepNames those
+        // compile to `__name(f, "f")`, and the browser context has no __name
+        // — the evaluate throws ReferenceError, the .catch below swallows it,
+        // and the overlay is captured OPAQUE (GIF frame + captions baked in).
+        // The animated composite then just re-renders that one static frame
+        // for the whole 10s: duration/luma checks all pass while the card
+        // doesn't move. Plain statements and inline argument arrows
+        // (`arr.forEach((el) => …)`) are never name-wrapped and stay safe.
+        await page
+          .evaluate(() => {
+            const inlineRules = [
+              [".meme-bg", "visibility", "hidden"],
+              ["html", "background", "transparent"],
+              ["body", "background", "transparent"],
+              [".iphone-frame", "background", "transparent"],
+              [".iphone-screen", "background", "transparent"],
+              [".meme-stage", "background", "transparent"],
+              [".vignette", "display", "none"],
+            ];
+            for (const [sel, prop, val] of inlineRules) {
+              document.querySelectorAll(sel).forEach((el) =>
+                (el as HTMLElement).style.setProperty(prop, val, "important"),
+              );
+            }
+          })
+          .catch((err: unknown) =>
+            // Never silent: a swallowed throw here means an opaque overlay and
+            // a frozen meme video that still passes every duration/luma check.
+            console.warn(`[recorder] static-card overlay transparency failed: ${(err as Error).message}`),
+          );
+        await page.waitForTimeout(100).catch(() => {});
+        const op = join(dir, "static-card-overlay.png");
+        await page.screenshot({ path: op, type: "png", omitBackground: true });
+        out.overlayPath = op;
+      }
+    }
+  } catch (err) {
+    console.warn(`[recorder] static-card overlay capture failed: ${(err as Error).message}`);
+  }
+  await ctx.close().catch(() => {});
+  return out;
+}
+
+/**
+ * Real animated meme: the page's own GIF/video (bytes fetched at capture
+ * time) looped for `durSec`, laid out exactly where the page puts it
+ * (object-fit: cover), with the caption layer composited on top over the
+ * page's dark background. No screencast, so no white navigation frames —
+ * frame 0 is already the meme. Still images composite too (held for the
+ * duration) so a card whose browser layer never painted still ships with
+ * its media instead of captions on black.
+ */
+async function assembleAnimatedMemeVideo(
+  cap: StaticCardCapture,
+  durSec: number,
+  outPath: string,
+  outW: number,
+  outH: number,
+  dir: string,
+): Promise<boolean> {
+  // The bytes were fetched at capture time (captureStaticCardFrame) — no
+  // second network round-trip here, and no failure mode where the browser
+  // painted nothing AND this re-fetch also missed (that combination was the
+  // captions-on-black output).
+  if (!cap.overlayPath || !cap.media?.bytes) return false;
+  let mediaPath = "";
+  let kind: "gif" | "video" | "still" = "still";
+  try {
+    const buf = cap.media.bytes;
+    const ct = cap.media.contentType || "";
+    const head = buf.subarray(0, 12).toString("latin1");
+    if (head.startsWith("GIF8") || ct.includes("gif")) kind = "gif";
+    else if (ct.startsWith("video/") || head.slice(4, 8) === "ftyp" || buf.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]))) kind = "video";
+    mediaPath = join(dir, kind === "gif" ? "meme-media.gif" : kind === "video" ? "meme-media.mp4" : "meme-media.img");
+    await writeFile(mediaPath, buf);
+  } catch (err) {
+    console.warn(`[recorder] animated meme media decode failed: ${(err as Error).message}`);
+    return false;
+  }
+
+  const even = (n: number) => Math.max(2, Math.round(n / 2) * 2);
+  const cw = even(cap.canvasW);
+  const ch = even(cap.canvasH);
+  const rx = Math.round(cap.media.x * SUPERSAMPLE);
+  const ry = Math.round(cap.media.y * SUPERSAMPLE);
+  const rw = even(cap.media.w * SUPERSAMPLE);
+  const rh = even(cap.media.h * SUPERSAMPLE);
+  const filter =
+    `[1:v]fps=${FPS},scale=${rw}:${rh}:force_original_aspect_ratio=increase,crop=${rw}:${rh},setsar=1[m];` +
+    `[0:v][m]overlay=${rx}:${ry}:shortest=0[b];` +
+    `[b][2:v]overlay=0:0,` +
+    `scale=${outW}:${outH}:force_original_aspect_ratio=increase,crop=${outW}:${outH},setsar=1,format=yuv420p[out]`;
+  try {
+    await runFfmpeg([
+      "-y",
+      "-f", "lavfi", "-i", `color=c=0x090a0c:s=${cw}x${ch}:r=${FPS}:d=${durSec.toFixed(3)}`,
+      ...(kind === "gif" ? ["-ignore_loop", "0"] : kind === "video" ? ["-stream_loop", "-1"] : ["-loop", "1"]),
+      "-i", mediaPath,
+      "-i", cap.overlayPath,
+      "-filter_complex", filter,
+      "-map", "[out]",
+      "-an",
+      "-c:v", "libx264", "-profile:v", "high", "-level", "4.0", "-preset", "fast",
+      "-crf", "28", "-r", String(FPS), "-g", String(FPS * 2),
+      "-threads", "0",
+      "-movflags", "+faststart",
+      "-t", durSec.toFixed(3), outPath,
+    ]);
+  } catch (err) {
+    console.warn(`[recorder] animated meme encode failed, using still card: ${(err as Error).message}`);
+    return false;
+  }
+  // Belt and braces: never ship a blank opening frame.
+  const st = await frameStats(outPath, 0.1).catch(() => null);
+  if (st && isBlankFrame(st)) {
+    console.warn("[recorder] animated meme came out blank — using still card");
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Encode a static-card video: the captured still held for `durSec` with a
+ * fade-in at the head and a fade-out at the tail. Codec args mirror
+ * assembleAppSlidesVideo exactly (same x264 profile/preset/gop/faststart) so
+ * every deliverable stays platform-identical. Returns the video duration.
+ */
+async function assembleStaticCardVideo(
+  framePath: string,
+  durSec: number,
+  outPath: string,
+  outW: number,
+  outH: number,
+): Promise<number> {
+  if (durSec <= STATIC_CARD_FADE_IN_SEC + STATIC_CARD_FADE_OUT_SEC) {
+    throw new Error(`assembleStaticCardVideo: duration ${durSec}s too short for the fades`);
+  }
+  const fadeOutStart = (durSec - STATIC_CARD_FADE_OUT_SEC).toFixed(3);
+  const filter =
+    `[0:v]scale=${outW}:${outH}:force_original_aspect_ratio=increase,crop=${outW}:${outH},` +
+    `setsar=1,fps=${FPS},` +
+    (STATIC_CARD_FADE_IN_SEC > 0 ? `fade=t=in:st=0:d=${STATIC_CARD_FADE_IN_SEC},` : "") +
+    (STATIC_CARD_FADE_OUT_SEC > 0 ? `fade=t=out:st=${fadeOutStart}:d=${STATIC_CARD_FADE_OUT_SEC},` : "") +
+    `format=yuv420p[out]`;
+  await runFfmpeg([
+    "-y",
+    "-loop", "1", "-framerate", String(FPS), "-i", framePath,
+    "-filter_complex", filter,
+    "-map", "[out]",
+    "-c:v", "libx264", "-profile:v", "high", "-level", "4.0", "-preset", "fast",
+    "-crf", "28", "-r", String(FPS), "-g", String(FPS * 2),
+    "-threads", "0",
+    "-movflags", "+faststart",
+    "-t", durSec.toFixed(3), outPath,
+  ]);
+  return durSec;
 }
 
 /**
@@ -1381,7 +1803,12 @@ export function computeScreencastDurationMs(
     // ── Priority 2: page-declared target duration ─────────────────────────
     if (pageInfo.recordDurationMs > 0) {
       console.log(`[recorder] Using page-declared recordDurationMs: ${pageInfo.recordDurationMs}ms`);
-      durationMs = pageInfo.recordDurationMs;
+      // Page-declared durations (e.g. song videos baking the exact song
+      // length) bypass the auto-cap — they are as authoritative as an
+      // explicit caller durationMs. The old cap silently truncated 3m30s
+      // songs to 3:00, making /songs renders hang at 3-min then cut off.
+      // The EXPLICIT_DURATION_CAP_MS (15min) still applies as a sanity guard.
+      return Math.min(pageInfo.recordDurationMs, EXPLICIT_DURATION_CAP_MS);
     } else if (pageInfo.declaredBeats > 0) {
       // Every beat up to the last gets its normal per-format pace; the final
       // beat (the CTA screen) is capped at LAST_FRAME_HOLD_MS regardless of
@@ -1401,7 +1828,8 @@ export function computeScreencastDurationMs(
     }
   }
 
-  // Auto-computed durations respect the (env-overridable) cap.
+  // Auto-computed durations (beat-counting heuristics) respect the cap.
+  // Page-declared durations already returned above.
   return Math.min(durationMs || DEFAULT_BEAT_MS * 3, autoLenCapMs());
 }
 
@@ -1587,6 +2015,10 @@ export interface ComposeScreencastInput {
   audioVolume?: number;
   /** Bed level for the ducked music track before sidechain compression. */
   musicVolume?: number;
+  /** Local SFX clip files + their offset (see RecordOptions.sfxCues). Only
+   *  mixed in when at least one of audioPath/musicPath is also set —
+   *  buildAudioMixFilter has nothing to attach a bare SFX-only mix to. */
+  sfxCues?: Array<{ path: string; atSec: number; volume?: number }>;
 }
 
 /**
@@ -1600,7 +2032,11 @@ export interface ComposeScreencastInput {
  *                    (the "normalize the final mix" step)
  *
  * Input mapping: [0:v] webm, [1:a] primary voice, [2:a] music bed. When only
- * music exists it lands on [1:a].
+ * music exists it lands on [1:a]. Optional SFX cues occupy whichever indices
+ * come next (see sfxCues below) — added as a fourth ("append the SFX mix")
+ * stage so every branch above is untouched byte-for-byte when no cues are
+ * passed in (the overwhelming majority of calls: /slideshow, and any /story
+ * render before this feature or with STORY_SFX_DISABLED=1).
  */
 export function buildAudioMixFilter(o: {
   hasVoice: boolean;
@@ -1613,6 +2049,16 @@ export function buildAudioMixFilter(o: {
   fadeDurSec: number;
   /** Whether the primary [1:a] track should repeat to fill the video. */
   primaryAudioLoops?: boolean;
+  /**
+   * Short SFX clips layered under the mix, one input each, at [0:v] +
+   * (1 or 2 audio tracks) + i. `atSec` becomes an `adelay` (silence-padded
+   * to land at the right offset); `volume` defaults to 0.5 — these are
+   * meant as quiet accents, never louder than the voice/bed they sit under.
+   * No-op (returns exactly the un-appended base filter) when hasVoice AND
+   * hasMusic are both false — there's nothing to attach a bare SFX mix to,
+   * and Story Mode's cues are only ever computed alongside its narration.
+   */
+  sfxCues?: Array<{ atSec: number; volume?: number }>;
 }): string | null {
   const dur = o.showDurSec;
   const primaryLoop = o.primaryAudioLoops === false ? "" : ",aloop=loop=-1:size=2e9";
@@ -1624,24 +2070,46 @@ export function buildAudioMixFilter(o: {
   const musicIdx = o.hasVoice ? 2 : 1;
   const musicChain = `[${musicIdx}:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,aloop=loop=-1:size=2e9,atrim=0:${dur.toFixed(3)},volume=${musicVol.toFixed(2)},afade=t=out:st=${Math.max(0, dur - o.fadeDurSec).toFixed(2)}:d=${o.fadeDurSec},apad,atrim=0:${dur.toFixed(3)}`;
 
+  let base: string;
   if (o.hasVoice && o.hasMusic) {
     // The voice label feeds BOTH the sidechain compressor and the final amix.
     // This ffmpeg build rejects a reused label as a second input, so the
     // voice is duplicated with asplit — the sidechain only DIPS the bed.
     const voice = `[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo${primaryLoop},atrim=0:${voiceTail.toFixed(3)},volume=${voiceVol.toFixed(2)},afade=t=out:st=${Math.max(0, voiceTail - o.fadeDurSec).toFixed(2)}:d=${o.fadeDurSec},apad,atrim=0:${dur.toFixed(3)},asplit=2[voice][voice2]`;
-    return `${voice};${musicChain}[music];[music][voice]sidechaincompress=threshold=0.04:ratio=12:attack=30:release=350[duck];[duck][voice2]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[aout]`;
+    base = `${voice};${musicChain}[music];[music][voice]sidechaincompress=threshold=0.04:ratio=12:attack=30:release=350[duck];[duck][voice2]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[aout]`;
+  } else if (o.hasMusic) {
+    base = `${musicChain},alimiter=limit=0.95[aout]`;
+  } else if (o.autoDuration) {
+    // Single-track voice path. The narration plays ONCE (no `aloop` —
+    // looping it made a story's opening repeat during the silent outro
+    // tail), then apad fills the rest with silence. autoDuration keeps the
+    // legacy plain-apad chain.
+    base = `[1:a]aresample=44100${primaryLoop},apad,atrim=0:${dur.toFixed(3)},alimiter=limit=0.95[aout]`;
+  } else {
+    base = `[1:a]aresample=44100${primaryLoop},atrim=0:${voiceTail.toFixed(3)},volume=${voiceVol.toFixed(2)},afade=t=out:st=${Math.max(0, voiceTail - o.fadeDurSec).toFixed(2)}:d=${o.fadeDurSec},apad,atrim=0:${dur.toFixed(3)},alimiter=limit=0.95[aout]`;
   }
-  if (o.hasMusic) {
-    return `${musicChain},alimiter=limit=0.95[aout]`;
-  }
-  // Single-track voice path. The narration plays ONCE (no `aloop` — looping
-  // it made a story's opening repeat during the silent outro tail), then
-  // apad fills the rest with silence. The autoDuration variant keeps the
-  // legacy plain-apad chain.
-  if (o.autoDuration) {
-    return `[1:a]aresample=44100${primaryLoop},apad,atrim=0:${dur.toFixed(3)},alimiter=limit=0.95[aout]`;
-  }
-  return `[1:a]aresample=44100${primaryLoop},atrim=0:${voiceTail.toFixed(3)},volume=${voiceVol.toFixed(2)},afade=t=out:st=${Math.max(0, voiceTail - o.fadeDurSec).toFixed(2)}:d=${o.fadeDurSec},apad,atrim=0:${dur.toFixed(3)},alimiter=limit=0.95[aout]`;
+
+  const cues = o.sfxCues || [];
+  if (!cues.length) return base;
+
+  // Append an SFX stage on top of the already-correct base mix: rename its
+  // final [aout] to [premix], delay-pad each SFX input to its cue offset,
+  // then amix everything back down to [aout]. base's own length (already
+  // trimmed/padded to `dur` in every branch above) stays the mix's
+  // duration=first anchor, so total show length is unaffected by adding
+  // cues. Each SFX input lands right after whichever audio tracks are in
+  // use: [0:v] webm always occupies 0, so voice/music take 1 (or 1+2), and
+  // SFX cues start at whichever index comes next.
+  const sfxBaseIdx = 1 + (o.hasVoice ? 1 : 0) + (o.hasMusic ? 1 : 0);
+  const legs = cues.map((c, i) => {
+    const idx = sfxBaseIdx + i;
+    const delayMs = Math.max(0, Math.round(c.atSec * 1000));
+    const vol = c.volume ?? 0.5;
+    return `[${idx}:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,adelay=${delayMs}:all=1,volume=${vol.toFixed(2)}[sfx${i}]`;
+  });
+  const labels = cues.map((_, i) => `[sfx${i}]`).join("");
+  const premix = base.replace(/\[aout\]$/, "[premix]");
+  return `${premix};${legs.join(";")};[premix]${labels}amix=inputs=${1 + cues.length}:duration=first:normalize=0,alimiter=limit=0.95[aout]`;
 }
 
 /**
@@ -1694,8 +2162,14 @@ export async function composeScreencastToMp4(
     audioVolume = 0.5,
     musicVolume,
   } = input;
+  // SFX cues are only meaningful alongside voice/music — buildAudioMixFilter
+  // has no bare-SFX branch (see its own doc comment), so they're dropped
+  // here rather than silently building a filter graph nothing will map.
+  const sfxCues = audioPath || musicPath ? input.sfxCues || [] : [];
 
   const probedSec = await probeDuration(webmPath);
+  const cleanStartSec = await findCleanTrimSec(webmPath, showStartMs / 1000, probedSec || 10);
+  const cleanStartMs = Math.round(cleanStartSec * 1000);
 
   // Where the file starts, how long the opening frame is held, and the
   // poster-frame moment. Interactive pages (story/audio-driven) trim exactly
@@ -1703,7 +2177,7 @@ export async function composeScreencastToMp4(
   // separately-mixed narration stays in sync; silent beat-driven pages keep a
   // short 1.5s hold. Static pages keep the legacy lead-trim + poster hold.
   const trim = computeScreencastTrim({
-    showStartMs,
+    showStartMs: cleanStartMs,
     showEndMs,
     durationMs,
     videoLenSec: probedSec,
@@ -1742,6 +2216,9 @@ export async function composeScreencastToMp4(
     primaryAudioLoops: input.primaryAudioRole !== "narration",
     voiceTailSec,
     fadeDurSec,
+    sfxCues: sfxCues.length
+      ? sfxCues.map((c) => ({ atSec: c.atSec, volume: c.volume }))
+      : undefined,
   });
 
   // Interactive (audio-driven) pages seek the webm INPUT — the webm carries no
@@ -1763,8 +2240,8 @@ export async function composeScreencastToMp4(
   const encoder = process.env.FFMPEG_ENCODER || "libx264";
   const nvenc = encoder === "h264_nvenc" || encoder === "hevc_nvenc";
   const videoCodecArgs = nvenc
-    ? ["-c:v", encoder, "-preset", "p4", "-cq", "23", "-rc", "vbr", "-b:v", "0"]
-    : ["-c:v", "libx264", "-preset", "fast", "-crf", "23"];
+    ? ["-c:v", encoder, "-preset", "p4", "-cq", "28", "-rc", "vbr", "-b:v", "0"]
+    : ["-c:v", "libx264", "-preset", "fast", "-crf", "28"];
 
   const finalArgs = [
     "-y",
@@ -1777,6 +2254,9 @@ export async function composeScreencastToMp4(
     // loops.
     ...(audioPath ? ["-i", audioPath] : []),
     ...(musicPath ? ["-stream_loop", "-1", "-i", musicPath] : []),
+    // SFX inputs land right after voice/music, matching the index math in
+    // buildAudioMixFilter's sfxBaseIdx.
+    ...sfxCues.flatMap((c) => ["-i", c.path]),
     "-filter_complex",
     audioFilter ? `${filter};${audioFilter}` : filter,
     "-map",
@@ -1790,12 +2270,17 @@ export async function composeScreencastToMp4(
     "+faststart",
     "-vsync",
     "vfr",
+    "-threads",
+    "0",
     ...(anyAudio ? ["-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2"] : ["-an"]),
     mp4Path,
   ];
   if (process.env.DEBUG_FFMPEG) {
     console.log("[recorder] filter_complex=", audioFilter ? `${filter};${audioFilter}` : filter);
-    console.log("[recorder] inputs=", [webmPath, audioPath, musicPath].filter(Boolean).join(" | "));
+    console.log(
+      "[recorder] inputs=",
+      [webmPath, audioPath, musicPath, ...sfxCues.map((c) => c.path)].filter(Boolean).join(" | "),
+    );
     console.log("[recorder] input seek=", inputSeekArgs.join(" "));
     console.log("[recorder] output trim=", outputTrimArgs.join(" "));
   }
@@ -1807,7 +2292,7 @@ export async function composeScreencastToMp4(
   try {
     await unlink(webmPath);
   } catch {}
-  for (const p of [audioPath, musicPath]) {
+  for (const p of [audioPath, musicPath, ...sfxCues.map((c) => c.path)]) {
     if (p) {
       try {
         await unlink(p);
@@ -1842,7 +2327,7 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
   const mp4Path = join(RECORDINGS_DIR, `${id}.mp4`);
   const thumbPath = join(RECORDINGS_DIR, `${id}-thumb.jpg`);
 
-  const viewport = viewportDims((opts.viewport || "vertical") as ViewportPreset);
+  const viewport = VIEWPORTS[opts.viewport || "vertical"];
   const background = opts.background || "blur";
   const aspectRatio = opts.aspectRatio || "9:16";
   const autoDuration = opts.autoDuration !== false;
@@ -1902,15 +2387,14 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
     const pageInfo = await collectPageInfo(page);
 
     const beatMs = pageInfo.beatMs || DEFAULT_BEAT_MS;
-    const audioPath = await resolveAudioForMix(opts.songUrl, pageInfo.audioSrc, opts.url, id);
-    // Second track (ducked bed): explicit musicUrl > page's own <audio id="score">.
-    // Never resolves when the page already bakes narration into the webm.
-    const musicPath = await resolveAudioForMix(
-      opts.musicUrl,
-      pageInfo.musicSrc,
-      opts.url,
-      `${id}-music`,
-    );
+    // Parallelize both audio fetches — was sequential (two awaits in series).
+    // Saves ~1–3s when both tracks are remote URLs.
+    const [audioPath, musicPath] = await Promise.all([
+      resolveAudioForMix(opts.songUrl, pageInfo.audioSrc, opts.url, id),
+      // Second track (ducked bed): explicit musicUrl > page's own <audio id="score">.
+      // Never resolves when the page already bakes narration into the webm.
+      resolveAudioForMix(opts.musicUrl, pageInfo.musicSrc, opts.url, `${id}-music`),
+    ]);
 
     // APPSLIDES FAST PATH (faster-than-realtime). appslides is a deck of static
     // full-bleed slides, so screenshot each settled slide and crossfade the
@@ -1978,6 +2462,44 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
 
 
     // ΓöÇΓöÇ SCREENCAST PATH ΓöÇΓöÇ
+    // STATIC-CARD FAST PATH (faster-than-realtime). Single-page memes are one
+    // settled composition — no beats, no audio — so screenshot the settled
+    // frame once and let ffmpeg hold it for the page's target duration with
+    // fades, instead of burning 6s of real-time screencast on a still.
+    if (isStaticCardPage(pageInfo, { hasMixAudio: !!audioPath || !!musicPath })) {
+      console.log(`[recorder] Static-card fast path — single settled frame, ${staticCardDurationMs()}ms`);
+      await page.close().catch(() => {});
+      await context.close().catch(() => {});
+
+      const outWidth = opts.outWidth || VERTICAL_OUT_W;
+      const outHeight = opts.outHeight || VERTICAL_OUT_H;
+      const durSec = staticCardDurationMs() / 1000;
+
+      const cap = await captureStaticCardFrame(browser, opts.url, opts, workDir);
+      const animated = await assembleAnimatedMemeVideo(cap, durSec, mp4Path, outWidth, outHeight, workDir);
+      console.log(`[recorder] static card: ${animated ? "looping the meme's own animation" : "still frame"} for ${durSec}s`);
+      const videoDurSec = animated
+        ? durSec
+        : await assembleStaticCardVideo(cap.framePath, durSec, mp4Path, outWidth, outHeight);
+
+      await assertMp4Healthy(mp4Path);
+      const thumb = await makeThumbnail(mp4Path, thumbPath, 0.45);
+      const mp4Stat = await stat(mp4Path);
+      return {
+        id,
+        mp4Path,
+        mp4Url: `${baseUrl}/api/record/${id}/download`,
+        thumbnailPath: thumb,
+        thumbnailUrl: thumb ? `${baseUrl}/api/record/${id}/thumbnail` : undefined,
+        mp4SizeBytes: mp4Stat.size,
+        durationMs: Math.round(videoDurSec * 1000),
+        success: true,
+        output: { width: outWidth, height: outHeight, aspectRatio },
+        frameColor: "none",
+        viewport: { width: viewport.width, height: viewport.height, name: viewport.name },
+      };
+    }
+
     // (recordClockStart was stamped at newPage)
 
     // Wait for page ready signal before capturing the opening shot.
@@ -2068,6 +2590,9 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
       outHeight,
       audioVolume: opts.audioVolume,
       musicVolume: opts.musicVolume,
+      // Drop any cue whose temp file went missing (e.g. cleaned up by a
+      // retry) rather than handing ffmpeg a dead -i path.
+      sfxCues: (opts.sfxCues || []).filter((c) => c.path && existsSync(c.path)),
     });
     const mp4Stat = await stat(mp4Path);
     return {
@@ -2131,7 +2656,7 @@ function updateQueuePositions(): void {
   });
 }
 
-export function acquireJobSlot(id: string): Promise<void> {
+function acquireJobSlot(id: string): Promise<void> {
   if (runningJobsCount < MAX_CONCURRENT_JOBS) {
     runningJobsCount++;
     return Promise.resolve();
@@ -2142,7 +2667,7 @@ export function acquireJobSlot(id: string): Promise<void> {
   });
 }
 
-export function releaseJobSlot(): void {
+function releaseJobSlot(): void {
   const next = jobQueue.shift();
   if (next) {
     // Hand the slot straight over — runningJobsCount stays as it is.
@@ -2158,15 +2683,6 @@ export function releaseJobSlot(): void {
 /** Live queue depth — surfaced by /api/record so the UI can show the backlog. */
 export function getRenderQueueStatus(): { running: number; queued: number; capacity: number } {
   return { running: runningJobsCount, queued: jobQueue.length, capacity: MAX_CONCURRENT_JOBS };
-}
-
-let isShuttingDown = false;
-export function setShuttingDown() {
-  isShuttingDown = true;
-}
-
-export function isWorkerShuttingDown() {
-  return isShuttingDown;
 }
 
 async function probeDuration(p: string): Promise<number | null> {
