@@ -454,7 +454,7 @@ export function runFfmpeg(args: string[]): Promise<void> {
       stderrChunks.push(d);
       if (stderrChunks.length > 300) stderrChunks.shift();
     });
-    ffmpeg.on("close", (code) => {
+    ffmpeg.on("close", (code, signal) => {
       clearTimeout(killer);
       const fullStderr = Buffer.concat(stderrChunks).toString();
       if (process.env.DEBUG_FFMPEG) {
@@ -478,6 +478,19 @@ export function runFfmpeg(args: string[]): Promise<void> {
         );
       }
       if (code === 0) return resolve();
+      if (code === null && signal) {
+        // code === null means the process died to a SIGNAL — ffmpeg never
+        // chose to exit. Almost always the kernel OOM killer: x264's lookahead
+        // buffers plus whatever else is resident (a Chromium that wasn't
+        // closed before the encode) blow past the container limit. Say so —
+        // "exited null" alone sends everyone reading the logs in the wrong
+        // direction.
+        return reject(
+          new Error(
+            `FFmpeg was killed by signal ${signal} (no exit code) — usually the Linux OOM killer: x264 peak memory + anything else resident (e.g. a browser still open during the encode) exceeded the container limit. Last stderr: ${fullStderr.slice(-1500)}`,
+          ),
+        );
+      }
       const stderr = fullStderr.slice(-3000);
       reject(new Error(`FFmpeg exited ${code}: ${stderr}`));
     });
@@ -676,7 +689,7 @@ function runFfmpegCapture(args: string[]): Promise<Buffer> {
       errChunks.push(d);
       if (errChunks.length > 100) errChunks.shift();
     });
-    ffmpeg.on("close", (code) => {
+    ffmpeg.on("close", (code, signal) => {
       clearTimeout(killer);
       if (timedOut) {
         const tail = Buffer.concat(errChunks).toString().slice(-1500);
@@ -687,6 +700,13 @@ function runFfmpegCapture(args: string[]): Promise<Buffer> {
         );
       }
       if (code === 0) return resolve(Buffer.concat(out));
+      if (code === null && signal) {
+        return reject(
+          new Error(
+            `FFmpeg was killed by signal ${signal} (no exit code) — usually the Linux OOM killer: x264 peak memory + anything else resident (e.g. a browser still open during the encode) exceeded the container limit. Last stderr: ${Buffer.concat(errChunks).toString().slice(-1500)}`,
+          ),
+        );
+      }
       reject(new Error(`FFmpeg exited ${code}: ${Buffer.concat(errChunks).toString().slice(-1500)}`));
     });
     ffmpeg.on("error", (e) => {
@@ -2554,6 +2574,12 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
 
     await page.close();
     await context.close(); // triggers Playwright to flush the .webm
+    // Free Chromium BEFORE the encode. The .webm is flushed and the browser is
+    // never used again; x264's lookahead buffers + Chromium's resident set
+    // together push the container over its memory limit mid-encode, and the
+    // kernel OOM-kill lands on ffmpeg as "FFmpeg exited null" (SIGKILL, no
+    // exit code) — exactly what production hit on a long screencast.
+    await browser.close().catch(() => {});
 
     // Find the .webm written by Playwright.
     const webmFiles = (await readdir(workDir)).filter((f) => f.endsWith(".webm"));
@@ -2612,7 +2638,7 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
       viewport: { width: viewport.width, height: viewport.height, name: viewport.name },
     };
   } finally {
-    await browser.close();
+    await browser.close().catch(() => {}); // no-op when closed before the encode
   }
 }
 
@@ -2833,7 +2859,6 @@ export async function runJob(opts: RecordOptions, runner: JobRunner): Promise<Jo
 export const getJob = (id: string): JobRecord | undefined => jobs.get(id);
 export const listJobs = (): JobRecord[] =>
   Array.from(jobs.values()).sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1));
-
 // === worker-only BEGIN: HTTP-layer exports (getRecordingStatus + recorderDiagnostics) ===
 /**
  * The HTTP layer's name for getJob: returns the JobRecord (status/message/
