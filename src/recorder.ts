@@ -430,6 +430,25 @@ function ffmpegTimeoutMs(): number {
 }
 
 /**
+ * Memory-lean x264 settings. `-threads 0` + `-preset fast` (rc-lookahead 30,
+ * one frame-thread per core) makes x264's peak RSS scale with core count and
+ * the 1080x1920 blur-composite graph; on a memory-capped container that ends
+ * in a kernel OOM SIGKILL mid-encode (seen ~1:25 into a 1:30+ render).
+ * veryfast + short lookahead + few threads costs a little file size but keeps
+ * the peak flat. Override thread count with RECORD_FFMPEG_THREADS.
+ */
+export function x264LeanArgs(crf = 28): string[] {
+  const t = Number(getEnv("RECORD_FFMPEG_THREADS"));
+  const threads = Number.isFinite(t) && t > 0 ? Math.floor(t) : 2;
+  return [
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", String(crf),
+    "-x264-params", `rc-lookahead=10:ref=2:bframes=2:threads=${threads}:lookahead-threads=1`,
+    "-threads", String(threads),
+    "-filter_complex_threads", "1",
+  ];
+}
+
+/**
  * Run ffmpeg to completion. Robust where child_process `exec` is not: spawn
  * streams stderr through a ring buffer instead of the 1MB maxBuffer cap that
  * kills long re-encodes (the Superhybrid stitch), and SIGKILLs after
@@ -1452,9 +1471,8 @@ async function assembleAppSlidesVideo(
   args.push("-filter_complex", parts.join(";"));
   args.push("-map", finalLabel);
   args.push(
-    "-c:v", "libx264", "-profile:v", "high", "-level", "4.0", "-preset", "fast",
-    "-crf", "28", "-pix_fmt", "yuv420p", "-r", String(FPS), "-g", String(FPS * 2),
-    "-threads", "0",
+    ...x264LeanArgs(28), "-profile:v", "high", "-level", "4.0",
+    "-pix_fmt", "yuv420p", "-r", String(FPS), "-g", String(FPS * 2),
     "-movflags", "+faststart", "-t", total.toFixed(3), outPath,
   );
   await runFfmpeg(args);
@@ -1740,9 +1758,8 @@ async function assembleAnimatedMemeVideo(
       "-filter_complex", filter,
       "-map", "[out]",
       "-an",
-      "-c:v", "libx264", "-profile:v", "high", "-level", "4.0", "-preset", "fast",
-      "-crf", "28", "-r", String(FPS), "-g", String(FPS * 2),
-      "-threads", "0",
+      ...x264LeanArgs(28), "-profile:v", "high", "-level", "4.0",
+      "-r", String(FPS), "-g", String(FPS * 2),
       "-movflags", "+faststart",
       "-t", durSec.toFixed(3), outPath,
     ]);
@@ -1787,9 +1804,8 @@ async function assembleStaticCardVideo(
     "-loop", "1", "-framerate", String(FPS), "-i", framePath,
     "-filter_complex", filter,
     "-map", "[out]",
-    "-c:v", "libx264", "-profile:v", "high", "-level", "4.0", "-preset", "fast",
-    "-crf", "28", "-r", String(FPS), "-g", String(FPS * 2),
-    "-threads", "0",
+    ...x264LeanArgs(28), "-profile:v", "high", "-level", "4.0",
+    "-r", String(FPS), "-g", String(FPS * 2),
     "-movflags", "+faststart",
     "-t", durSec.toFixed(3), outPath,
   ]);
@@ -2261,7 +2277,7 @@ export async function composeScreencastToMp4(
   const nvenc = encoder === "h264_nvenc" || encoder === "hevc_nvenc";
   const videoCodecArgs = nvenc
     ? ["-c:v", encoder, "-preset", "p4", "-cq", "28", "-rc", "vbr", "-b:v", "0"]
-    : ["-c:v", "libx264", "-preset", "fast", "-crf", "28"];
+    : x264LeanArgs(28);
 
   const finalArgs = [
     "-y",
@@ -2290,8 +2306,6 @@ export async function composeScreencastToMp4(
     "+faststart",
     "-vsync",
     "vfr",
-    "-threads",
-    "0",
     ...(anyAudio ? ["-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2"] : ["-an"]),
     mp4Path,
   ];
