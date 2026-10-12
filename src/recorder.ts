@@ -44,15 +44,14 @@ import { existsSync, readdirSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { randomUUID } from "crypto";
-
-// === worker-only BEGIN: getEnv shim (bot imports { getEnv } from "../env") ===
-// Standalone worker has no ../env module — inline the same fail-open reader so
-// the engine below stays byte-identical to bot/src/lib/video/recorder.ts.
-function getEnv(key: string, fallback: string = ""): string {
-  const v = process.env[key];
-  return v && v.trim().length > 0 ? v : fallback;
-}
-// === worker-only END: getEnv shim ===
+// === worker-only BEGIN: env readers (bot imports { getEnv, isEnvTrue } from "../env") ===
+// Standalone worker has no ../env module — import them from the vendored
+// worker-env so the engine below stays byte-identical to
+// bot/src/lib/video/recorder.ts.
+import { getEnv, isEnvTrue } from "./worker-env";
+// === worker-only END: env readers ===
+import { createRequestGuard } from "./ssrf";
+import { registerLoop } from "./loop-registry";
 
 // ΓöÇΓöÇ Types ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
@@ -113,6 +112,9 @@ export interface RecordOptions {
    * existing voice+music mix completely unchanged.
    */
   sfxCues?: Array<{ path: string; atSec: number; volume?: number }>;
+  /** Final loudness pass (-16 LUFS, -1.5 dBTP) on the mixed track. Opt-in so
+   *  every other render keeps its mix byte-for-byte; Story Mode sets it. */
+  loudnorm?: boolean;
 }
 
 export interface RecordResult {
@@ -238,15 +240,55 @@ const EXPLICIT_DURATION_CAP_MS = 900_000;
 // path) and let ffmpeg hold it for the target duration with a fade-in and a
 // fade-out. Sub-second render, deterministic, no scroll driver involved.
 
+/**
+ * Block the recorded page (and anything it redirects to or scripts) from
+ * reaching private networks: loopback, Railway-internal, cloud metadata.
+ * Our own public origins are trusted. Disable with RECORD_BLOCK_PRIVATE_NETWORK=0.
+ */
+function trustedRecorderHosts(): string[] {
+  const out: string[] = [];
+  for (const k of ["PUBLIC_BASE_URL", "TEMP_PUBLISH_BASE_URL", "RECORD_API_URL", "BASE_URL"]) {
+    for (const part of String(getEnv(k) || "").split(",")) {
+      try {
+        const raw = part.trim();
+        if (raw) out.push(new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`).hostname);
+      } catch {
+        /* ignore malformed */
+      }
+    }
+  }
+  return out;
+}
+
+async function installNetworkGuard(ctx: { route: (url: string, h: (route: any) => unknown) => Promise<unknown> }): Promise<void> {
+  if (getEnv("RECORD_BLOCK_PRIVATE_NETWORK") === "0") return;
+  const allow = createRequestGuard(trustedRecorderHosts());
+  await ctx.route("**/*", async (route: any) => {
+    const url = route.request().url();
+    if (await allow(url)) return route.continue();
+    console.warn(`[recorder] blocked private-network request: ${url.slice(0, 120)}`);
+    return route.abort("blockedbyclient");
+  });
+}
+
 /** Target video length for a static card. Override with RECORD_STATIC_CARD_MS (bounded 3–60s). */
 export function staticCardDurationMs(): number {
   const raw = Number(getEnv("RECORD_STATIC_CARD_MS"));
-  return Math.min(60_000, Math.max(3_000, Number.isFinite(raw) && raw > 0 ? raw : 10_000));
+  return Math.min(60_000, Math.max(3_000, Number.isFinite(raw) && raw > 0 ? raw : 8_000));
 }
+/**
+ * Animated memes are looped for durSec + 2×this, then this much is cut off the
+ * front and the back — the first/last moments of a GIF/video loop (and any
+ * white/blank frame the media opens or closes on) never reach the output.
+ */
+const ANIMATED_MEME_TRIM_SEC = 1;
 /** Opening fade-in — long enough to feel intentional, short enough to leave a clean poster frame. */
 const STATIC_CARD_FADE_IN_SEC = 0;
 /** Closing fade-out (slightly longer than the fade-in, mirrored feel). */
 const STATIC_CARD_FADE_OUT_SEC = 0;
+/** Voiced static card: silent hold after the last word, and the closing fade (video + audio) inside it. */
+const VOICED_CARD_TAIL_SEC = 0.8;
+const VOICED_CARD_FADE_OUT_SEC = 0.4;
 
 /**
  * Does this page qualify for the static-card fast path? Pure + exported so
@@ -265,12 +307,14 @@ export function isStaticCardPage(
   if (opts.hasMixAudio) return false;
   if (pageInfo.appslidesVessel) return false;
   if (pageInfo.audioSrc || pageInfo.musicSrc || pageInfo.audioDurationSec > 0) return false;
-  // An explicit multi-beat declaration is authoritative — never fast-path it.
+  // Static-card requires the EXPLICIT VESSEL.staticCard=true opt-in from the
+  // page builder — never infer it from beat counts (that inference
+  // fast-pathed every 1-beat page to the ~8s card: the
+  // treat-everything-like-a-single-page-meme regression).
+  // An explicit multi-beat declaration is still authoritative even when the
+  // page flags itself — a misdeclared/miscounted deck must never fast-path.
   if (pageInfo.declaredBeats > 1) return false;
-  const declaredSingle =
-    pageInfo.declaredBeats === 1 ||
-    (pageInfo.declaredBeats === 0 && pageInfo.recordDurationMs > 0 && pageInfo.beatCount === 0);
-  return declaredSingle && pageInfo.beatCount === 0 && pageInfo.vesselBeatCount <= 1 && !!pageInfo.hasVesselHook;
+  return pageInfo.staticCard === true && pageInfo.beatCount === 0 && pageInfo.vesselBeatCount <= 1;
 }
 const DEFAULT_BEAT_MS = 5250; // FIXED: 5.25s per slide for all formats
 
@@ -802,6 +846,57 @@ function isBlankFrame(s: { mean: number; sd: number }): boolean {
 }
 
 /**
+ * White-wash detection for animated memes. `isBlankFrame` only catches FLAT
+ * white (sd <= 3) — but a GIF/video that opens on a white frame still gets the
+ * caption layer composited on top, and caption text/outlines push sd well past
+ * 3, so the white opener sailed through as "not blank". Here we measure how
+ * much of the frame is near-white instead: the card canvas is dark (0x090a0c),
+ * so a frame that is mostly near-white is the media flashing white.
+ */
+const WHITE_WASH_LUMA = 235;
+const WHITE_WASH_FRACTION = 0.55;
+
+async function frameWhiteFraction(path: string, atSec: number): Promise<number | null> {
+  try {
+    const raw = await runFfmpegCapture([
+      "-v", "error",
+      ...(atSec > 0 ? ["-ss", atSec.toFixed(3)] : []),
+      "-i", path,
+      "-vframes", "1",
+      "-vf", "scale=32:32",
+      "-pix_fmt", "gray",
+      "-f", "rawvideo",
+      "-",
+    ]);
+    if (raw.length === 0) return null;
+    let white = 0;
+    for (const b of raw) if (b >= WHITE_WASH_LUMA) white++;
+    return white / raw.length;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when neither the opening nor the closing frames of a finished animated
+ * meme flash white. If the meme's MIDDLE is itself mostly white (a genuinely
+ * white meme) there is nothing to flash against, so it counts as clean.
+ */
+async function animatedEdgesAreClean(mp4Path: string, durSec: number): Promise<boolean> {
+  const body = await frameWhiteFraction(mp4Path, durSec / 2);
+  if (body !== null && body >= WHITE_WASH_FRACTION) return true;
+  const edges = [0, 0.1, 0.3, Math.max(0, durSec - 0.35), Math.max(0, durSec - 0.12)];
+  for (const t of edges) {
+    const f = await frameWhiteFraction(mp4Path, t);
+    if (f !== null && f >= WHITE_WASH_FRACTION) {
+      console.warn(`[recorder] animated meme flashes white at ${t.toFixed(2)}s (${(f * 100).toFixed(0)}% near-white)`);
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Finds a lead-trim point at/after `baseSec` whose frame is not blank, scanned
  * on the RAW webm before compositing (no crop needed — at that stage the whole
  * frame is already just the page, there's no blurred bezel around it yet).
@@ -904,6 +999,37 @@ async function makeThumbnail(
     console.warn("[recorder] thumbnail failed:", (e as Error).message);
   }
   return undefined;
+}
+
+/**
+ * Make the file's own first frames the poster. Platforms (X, TikTok, IG, Telegram
+ * auto-covers) use frame 0 as the thumbnail, and a freshly started page is often
+ * a dark / half-faded frame. This swaps the first POSTER_FRAMES frames for the
+ * clean frame at `posterSec` (full-res, uncropped). Timing, audio and length are
+ * untouched; audio is stream-copied. Best-effort: any failure keeps the original.
+ * Disable with POSTER_FRAME=0.
+ */
+const POSTER_FRAMES = 3;
+async function stampPosterFrame(mp4Path: string, posterSec: number): Promise<boolean> {
+  if (process.env.POSTER_FRAME === "0" || posterSec < 0.3) return false;
+  const tmp = `${mp4Path}.poster.mp4`;
+  try {
+    const s = await frameStats(mp4Path, posterSec);
+    if (s === null || isBlankFrame(s)) return false;
+    await runFfmpeg([
+      "-y", "-i", mp4Path, "-ss", posterSec.toFixed(3), "-i", mp4Path,
+      "-filter_complex", `[0:v][1:v]overlay=eof_action=repeat:enable='lt(n,${POSTER_FRAMES})'[v]`,
+      "-map", "[v]", "-map", "0:a?",
+      ...x264LeanArgs(22), "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", tmp,
+    ]);
+    await assertMp4Healthy(tmp);
+    await rename(tmp, mp4Path);
+    return true;
+  } catch (e) {
+    console.warn("[recorder] poster frame stamp failed, keeping original first frame:", (e as Error).message);
+    await unlink(tmp).catch(() => {});
+    return false;
+  }
 }
 
 /**
@@ -1092,6 +1218,10 @@ export interface PageInfoForRecording {
   ctaMs: number;
   /** 0-indexed position of the CTA slide within the beat sequence. */
   ctaIndex: number;
+  /** Page explicitly opts in to the static-card fast path (single-page memes
+   *  set VESSEL.staticCard=true). Required gate: a page that merely ends up
+   *  with 1 beat must NEVER shortcut to the ~8s card. */
+  staticCard: boolean;
 }
 
 export async function collectPageInfo(page: any): Promise<PageInfoForRecording> {
@@ -1161,6 +1291,7 @@ export async function collectPageInfo(page: any): Promise<PageInfoForRecording> 
           !document.documentElement.innerHTML.includes("giphy.com"),
         ctaMs: Number(vessel.ctaMs) || 0,
         ctaIndex: Number.isFinite(Number(vessel.ctaIndex)) ? Number(vessel.ctaIndex) : -1,
+        staticCard: vessel.staticCard === true || vesselHook.staticCard === true,
       };
     })
     .catch(() => ({
@@ -1178,6 +1309,7 @@ export async function collectPageInfo(page: any): Promise<PageInfoForRecording> 
       appslidesVessel: false,
       ctaMs: 0,
       ctaIndex: -1,
+      staticCard: false,
     }));
 }
 
@@ -1206,6 +1338,7 @@ async function captureAppSlidesFrames(
     deviceScaleFactor: SUPERSAMPLE,
     reducedMotion: "reduce" as const,
   });
+  await installNetworkGuard(ctx);
   const page = await ctx.newPage();
 
   const url = new URL(pageUrl);
@@ -1357,6 +1490,7 @@ export async function captureSlideshowStillFrames(
       deviceScaleFactor: SUPERSAMPLE,
       reducedMotion: "reduce" as const,
     });
+    await installNetworkGuard(ctx);
     const page = await ctx.newPage();
     let targetGoto = pageUrl;
     if (!pageUrl.startsWith("data:")) {
@@ -1526,6 +1660,7 @@ async function captureStaticCardFrame(
     deviceScaleFactor: SUPERSAMPLE,
     reducedMotion: "reduce" as const,
   });
+  await installNetworkGuard(ctx);
   const page = await ctx.newPage();
 
   const url = new URL(pageUrl);
@@ -1743,28 +1878,53 @@ async function assembleAnimatedMemeVideo(
   const ry = Math.round(cap.media.y * SUPERSAMPLE);
   const rw = even(cap.media.w * SUPERSAMPLE);
   const rh = even(cap.media.h * SUPERSAMPLE);
-  const filter =
-    `[1:v]fps=${FPS},scale=${rw}:${rh}:force_original_aspect_ratio=increase,crop=${rw}:${rh},setsar=1[m];` +
-    `[0:v][m]overlay=${rx}:${ry}:shortest=0[b];` +
-    `[b][2:v]overlay=0:0,` +
-    `scale=${outW}:${outH}:force_original_aspect_ratio=increase,crop=${outW}:${outH},setsar=1,format=yuv420p[out]`;
-  try {
-    await runFfmpeg([
-      "-y",
-      "-f", "lavfi", "-i", `color=c=0x090a0c:s=${cw}x${ch}:r=${FPS}:d=${durSec.toFixed(3)}`,
-      ...(kind === "gif" ? ["-ignore_loop", "0"] : kind === "video" ? ["-stream_loop", "-1"] : ["-loop", "1"]),
-      "-i", mediaPath,
-      "-i", cap.overlayPath,
-      "-filter_complex", filter,
-      "-map", "[out]",
-      "-an",
-      ...x264LeanArgs(28), "-profile:v", "high", "-level", "4.0",
-      "-r", String(FPS), "-g", String(FPS * 2),
-      "-movflags", "+faststart",
-      "-t", durSec.toFixed(3), outPath,
-    ]);
-  } catch (err) {
-    console.warn(`[recorder] animated meme encode failed, using still card: ${(err as Error).message}`);
+  // Render longer than the 8s we ship and CUT the head and tail off: the first
+  // moments of a GIF/video loop (and the wrap point at the end) are where white
+  // flashes live. If the cut output still flashes white at either end, slide the
+  // window further into the loop (1s → 2s → 3s of head trim) and re-encode.
+  const headTrims =
+    kind === "still"
+      ? [0]
+      : [ANIMATED_MEME_TRIM_SEC, ANIMATED_MEME_TRIM_SEC * 2, ANIMATED_MEME_TRIM_SEC * 3];
+  let clean = false;
+  for (const trimSec of headTrims) {
+    const totalSec = durSec + trimSec + ANIMATED_MEME_TRIM_SEC;
+    const filter =
+      `[1:v]fps=${FPS},scale=${rw}:${rh}:force_original_aspect_ratio=increase,crop=${rw}:${rh},setsar=1[m];` +
+      `[0:v][m]overlay=${rx}:${ry}:shortest=0[b];` +
+      `[b][2:v]overlay=0:0,` +
+      `scale=${outW}:${outH}:force_original_aspect_ratio=increase,crop=${outW}:${outH},setsar=1,format=yuv420p` +
+      (trimSec > 0
+        ? `,trim=start=${trimSec.toFixed(3)}:end=${(trimSec + durSec).toFixed(3)},setpts=PTS-STARTPTS`
+        : "") +
+      `[out]`;
+    try {
+      await runFfmpeg([
+        "-y",
+        "-f", "lavfi", "-i", `color=c=0x090a0c:s=${cw}x${ch}:r=${FPS}:d=${totalSec.toFixed(3)}`,
+        ...(kind === "gif" ? ["-ignore_loop", "0"] : kind === "video" ? ["-stream_loop", "-1"] : ["-loop", "1"]),
+        "-i", mediaPath,
+        "-i", cap.overlayPath,
+        "-filter_complex", filter,
+        "-map", "[out]",
+        "-an",
+        ...x264LeanArgs(28), "-profile:v", "high", "-level", "4.0",
+        "-r", String(FPS), "-g", String(FPS * 2),
+        "-movflags", "+faststart",
+        "-t", durSec.toFixed(3), outPath,
+      ]);
+    } catch (err) {
+      console.warn(`[recorder] animated meme encode failed, using still card: ${(err as Error).message}`);
+      return false;
+    }
+    if (kind === "still" || (await animatedEdgesAreClean(outPath, durSec))) {
+      clean = true;
+      break;
+    }
+    console.warn(`[recorder] animated meme white flash with ${trimSec}s head trim — shifting the window`);
+  }
+  if (!clean) {
+    console.warn("[recorder] animated meme still flashes white after every window shift — using still card");
     return false;
   }
   // Belt and braces: never ship a blank opening frame.
@@ -1788,16 +1948,18 @@ async function assembleStaticCardVideo(
   outPath: string,
   outW: number,
   outH: number,
+  /** Closing fade to black (s). Used for voiced cards so the ending is clean; 0 = legacy hard hold. */
+  fadeOutSec = STATIC_CARD_FADE_OUT_SEC,
 ): Promise<number> {
-  if (durSec <= STATIC_CARD_FADE_IN_SEC + STATIC_CARD_FADE_OUT_SEC) {
+  if (durSec <= STATIC_CARD_FADE_IN_SEC + fadeOutSec) {
     throw new Error(`assembleStaticCardVideo: duration ${durSec}s too short for the fades`);
   }
-  const fadeOutStart = (durSec - STATIC_CARD_FADE_OUT_SEC).toFixed(3);
+  const fadeOutStart = (durSec - fadeOutSec).toFixed(3);
   const filter =
     `[0:v]scale=${outW}:${outH}:force_original_aspect_ratio=increase,crop=${outW}:${outH},` +
     `setsar=1,fps=${FPS},` +
     (STATIC_CARD_FADE_IN_SEC > 0 ? `fade=t=in:st=0:d=${STATIC_CARD_FADE_IN_SEC},` : "") +
-    (STATIC_CARD_FADE_OUT_SEC > 0 ? `fade=t=out:st=${fadeOutStart}:d=${STATIC_CARD_FADE_OUT_SEC},` : "") +
+    (fadeOutSec > 0 ? `fade=t=out:st=${fadeOutStart}:d=${fadeOutSec},` : "") +
     `format=yuv420p[out]`;
   await runFfmpeg([
     "-y",
@@ -2055,6 +2217,8 @@ export interface ComposeScreencastInput {
    *  mixed in when at least one of audioPath/musicPath is also set —
    *  buildAudioMixFilter has nothing to attach a bare SFX-only mix to. */
   sfxCues?: Array<{ path: string; atSec: number; volume?: number }>;
+  /** Append the -16 LUFS / -1.5 dBTP loudness pass (see buildAudioMixFilter). */
+  loudnorm?: boolean;
 }
 
 /**
@@ -2095,6 +2259,13 @@ export function buildAudioMixFilter(o: {
    * and Story Mode's cues are only ever computed alongside its narration.
    */
   sfxCues?: Array<{ atSec: number; volume?: number }>;
+  /**
+   * Opt-in final loudness pass: single-pass loudnorm to -16 LUFS integrated,
+   * -1.5 dBTP true peak (spoken-word target), resampled back to 44.1k stereo
+   * (loudnorm upsamples internally). Off by
+   * default so existing renders keep their mix byte-for-byte.
+   */
+  loudnorm?: boolean;
 }): string | null {
   const dur = o.showDurSec;
   const primaryLoop = o.primaryAudioLoops === false ? "" : ",aloop=loop=-1:size=2e9";
@@ -2125,8 +2296,10 @@ export function buildAudioMixFilter(o: {
     base = `[1:a]aresample=44100${primaryLoop},atrim=0:${voiceTail.toFixed(3)},volume=${voiceVol.toFixed(2)},afade=t=out:st=${Math.max(0, voiceTail - o.fadeDurSec).toFixed(2)}:d=${o.fadeDurSec},apad,atrim=0:${dur.toFixed(3)},alimiter=limit=0.95[aout]`;
   }
 
+  const finish = (f: string): string =>
+    o.loudnorm ? f.replace(/\[aout\]$/, ",loudnorm=I=-16:LRA=11:TP=-1.5,aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[aout]") : f;
   const cues = o.sfxCues || [];
-  if (!cues.length) return base;
+  if (!cues.length) return finish(base);
 
   // Append an SFX stage on top of the already-correct base mix: rename its
   // final [aout] to [premix], delay-pad each SFX input to its cue offset,
@@ -2145,7 +2318,7 @@ export function buildAudioMixFilter(o: {
   });
   const labels = cues.map((_, i) => `[sfx${i}]`).join("");
   const premix = base.replace(/\[aout\]$/, "[premix]");
-  return `${premix};${legs.join(";")};[premix]${labels}amix=inputs=${1 + cues.length}:duration=first:normalize=0,alimiter=limit=0.95[aout]`;
+  return finish(`${premix};${legs.join(";")};[premix]${labels}amix=inputs=${1 + cues.length}:duration=first:normalize=0,alimiter=limit=0.95[aout]`);
 }
 
 /**
@@ -2255,6 +2428,7 @@ export async function composeScreencastToMp4(
     sfxCues: sfxCues.length
       ? sfxCues.map((c) => ({ atSec: c.atSec, volume: c.volume }))
       : undefined,
+    loudnorm: input.loudnorm === true,
   });
 
   // Interactive (audio-driven) pages seek the webm INPUT — the webm carries no
@@ -2341,6 +2515,7 @@ export async function composeScreencastToMp4(
       ? phoneCropFilter(viewport.width, viewport.height, outWidth, outHeight) || "crop=iw:ih-44:0:44"
       : phoneCropFilter(viewport.width, viewport.height, outWidth, outHeight);
   const thumb = await makeThumbnail(mp4Path, thumbPath, thumbSec, thumbCrop);
+  await stampPosterFrame(mp4Path, thumbSec);
   
   return { durationMs: Math.round(showDurSec * 1000), thumbnailPath: thumb };
 }
@@ -2389,6 +2564,7 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
       viewport: { width: viewport.width, height: viewport.height },
       recordVideo: { dir: workDir, size: { width: viewport.width, height: viewport.height } },
     });
+    await installNetworkGuard(context);
 
     // Stamp the clock exactly when Playwright starts the webm recording.
     // This allows the ffmpeg trimmer to accurately slice off the page load white screen.
@@ -2500,21 +2676,49 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
     // settled composition — no beats, no audio — so screenshot the settled
     // frame once and let ffmpeg hold it for the page's target duration with
     // fades, instead of burning 6s of real-time screencast on a still.
-    if (isStaticCardPage(pageInfo, { hasMixAudio: !!audioPath || !!musicPath })) {
-      console.log(`[recorder] Static-card fast path — single settled frame, ${staticCardDurationMs()}ms`);
+    // A single narration clip (e.g. the short MP4 + VOICE hook on a single-page
+    // meme) can ride the static-card path: the card is sized to the voice, so the
+    // video ends right after the hook instead of a fixed 8s with dead air.
+    const narrationOnly = !!audioPath && !musicPath && opts.primaryAudioRole === "narration";
+    if (isStaticCardPage(pageInfo, { hasMixAudio: !!musicPath || (!!audioPath && !narrationOnly) })) {
+      console.log(`[recorder] Static-card fast path — single settled frame, ${narrationOnly ? "voiced" : staticCardDurationMs() + "ms"}`);
       await page.close().catch(() => {});
       await context.close().catch(() => {});
 
       const outWidth = opts.outWidth || VERTICAL_OUT_W;
       const outHeight = opts.outHeight || VERTICAL_OUT_H;
-      const durSec = staticCardDurationMs() / 1000;
+      let durSec = staticCardDurationMs() / 1000;
+      if (narrationOnly) {
+        // Voice length + a short silent tail that holds the card; fades land in the tail.
+        const voiceSec = await probeDuration(audioPath as string);
+        if (voiceSec && voiceSec > 0.5) durSec = Math.min(60, Math.max(3, voiceSec + VOICED_CARD_TAIL_SEC));
+      }
 
       const cap = await captureStaticCardFrame(browser, opts.url, opts, workDir);
       const animated = await assembleAnimatedMemeVideo(cap, durSec, mp4Path, outWidth, outHeight, workDir);
       console.log(`[recorder] static card: ${animated ? "looping the meme's own animation" : "still frame"} for ${durSec}s`);
       const videoDurSec = animated
         ? durSec
-        : await assembleStaticCardVideo(cap.framePath, durSec, mp4Path, outWidth, outHeight);
+        : await assembleStaticCardVideo(cap.framePath, durSec, mp4Path, outWidth, outHeight, narrationOnly ? VOICED_CARD_FADE_OUT_SEC : STATIC_CARD_FADE_OUT_SEC);
+
+      if (narrationOnly) {
+        // Pad the voice with silence to the exact card length and fade the audio out
+        // inside the silent tail, so the hook is never clipped and the end is click-free.
+        const voicedPath = join(workDir, "static-voiced.mp4");
+        const vol = (opts.audioVolume ?? 1.0).toFixed(2);
+        await runFfmpeg([
+          "-y",
+          "-i", mp4Path,
+          "-i", audioPath as string,
+          "-filter_complex",
+          `[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=0:${videoDurSec.toFixed(3)},volume=${vol},` +
+            `afade=t=out:st=${Math.max(0, videoDurSec - VOICED_CARD_FADE_OUT_SEC).toFixed(3)}:d=${VOICED_CARD_FADE_OUT_SEC},alimiter=limit=0.95[aout]`,
+          "-map", "0:v", "-map", "[aout]",
+          "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+          "-movflags", "+faststart", voicedPath,
+        ]);
+        await rename(voicedPath, mp4Path);
+      }
 
       await assertMp4Healthy(mp4Path);
       const thumb = await makeThumbnail(mp4Path, thumbPath, 0.45);
@@ -2633,6 +2837,7 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
       // Drop any cue whose temp file went missing (e.g. cleaned up by a
       // retry) rather than handing ffmpeg a dead -i path.
       sfxCues: (opts.sfxCues || []).filter((c) => c.path && existsSync(c.path)),
+      loudnorm: opts.loudnorm === true,
     });
     const mp4Stat = await stat(mp4Path);
     return {
@@ -2873,6 +3078,7 @@ export async function runJob(opts: RecordOptions, runner: JobRunner): Promise<Jo
 export const getJob = (id: string): JobRecord | undefined => jobs.get(id);
 export const listJobs = (): JobRecord[] =>
   Array.from(jobs.values()).sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1));
+
 // === worker-only BEGIN: HTTP-layer exports (getRecordingStatus + recorderDiagnostics) ===
 /**
  * The HTTP layer's name for getJob: returns the JobRecord (status/message/
@@ -2922,17 +3128,17 @@ function sweepStaleJobs(): void {
   }
 }
 
-// Run sweep every 15 minutes. Attach to globalThis so hot reloads don't
-// spawn duplicate intervals.
-const globalAny2 = globalThis as any;
-if (!globalAny2.__RALPH_RECORD_SWEEP__) {
-  const sweep = setInterval(sweepStaleJobs, 15 * 60 * 1000);
-  // Unref so the sweep never holds the process open (matches the marketplace
-  // and scheduler background jobs) ΓÇö otherwise importing this module in
-  // tests would keep the Node event loop alive forever.
-  if ((sweep as any).unref) (sweep as any).unref();
-  globalAny2.__RALPH_RECORD_SWEEP__ = sweep;
-}
+// Stale-job sweep every 15 minutes, owned by the loop registry: it holds the
+// cadence, jitter, failure backoff, and the run ledger, and registers by id so
+// a hot reload or a duplicate import cannot stack a second sweep. It arms only
+// once the registry is started, so importing this module in tests no longer
+// keeps the Node event loop alive.
+registerLoop({
+  id: "video.stale-job-sweep",
+  cadenceMs: 15 * 60 * 1000,
+  runOnStart: false,
+  run: sweepStaleJobs,
+});
 
 /**
  * Delete a finished job's MP4 file and remove it from the registry.

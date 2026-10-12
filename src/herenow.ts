@@ -16,6 +16,7 @@
  *   3. POST <finalizeUrl>    — finalize the version → live URL
  */
 import { readFile } from "fs/promises";
+import { publishViaBotIngest } from "./tempIngest";
 
 const HERENOW_API = "https://here.now/api/v1";
 
@@ -118,6 +119,11 @@ export async function publishMp4ToHereNow(
   opts: { title?: string; apiKey?: string; language?: string } = {},
 ): Promise<HereNowPublishResult> {
   const mp4 = await readFile(mp4Path);
+  if (!opts.apiKey) {
+    // P&R-hosted 24h page (bot ingest -> R2). null => fall through to here.now.
+    const viaBot = await publishViaBotIngest(new Uint8Array(mp4), opts.title);
+    if (viaBot) return viaBot;
+  }
   const title = opts.title || "MP4 Video";
   const safeTitle = title.replace(/[<>&"]/g, "");
   
@@ -183,8 +189,8 @@ export async function publishMp4ToHereNow(
 </style>
 <body>
 <div class="video-container" id="vc">
-  <div class="sound-btn" id="soundBtn">${tapText}</div>
-  <video src="ralph.mp4" poster="poster.jpg" playsinline loop muted autoplay></video>
+
+  <video src="ralph.mp4" poster="poster.jpg" playsinline loop autoplay controls></video>
   <div class="overlay" id="overlay">
     <a href="ralph.mp4" download class="download-btn" id="dl">${dlText}</a>
   </div>
@@ -192,25 +198,8 @@ export async function publishMp4ToHereNow(
 <script>
   const vc = document.getElementById('vc');
   const overlay = document.getElementById('overlay');
-  const vid = vc.querySelector('video');
-  const soundBtn = document.getElementById('soundBtn');
   
-  let hasInteracted = false;
-
-  // Unmute and hide sound button on first tap
-  soundBtn.addEventListener('click', (e) => {
-    e.stopPropagation(); // prevent toggling the download overlay immediately
-    vid.muted = false;
-    vid.play();
-    soundBtn.style.opacity = '0';
-    setTimeout(() => soundBtn.style.display = 'none', 300);
-    hasInteracted = true;
-    vid.controls = true; // reveal native controls after they unlock audio
-  });
-  
-  // Toggle overlay on subsequent clicks (only if unlocked via ?dl=1)
   vc.addEventListener('click', (e) => {
-    if (!hasInteracted) return;
     if (e.target.id === 'dl') return;
     const params = new URLSearchParams(window.location.search);
     if (!params.has('dl') && !params.has('download')) return;
