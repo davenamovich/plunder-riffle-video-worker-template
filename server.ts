@@ -12,6 +12,8 @@ import {
 import path from "path";
 import fs from "fs";
 import { publishMp4ToHereNow, mediaUrlFor } from "./src/herenow";
+import { startLoops } from "./src/loop-registry";
+import { registerMixRoutes } from "./src/mix";
 
 function isValidPublicUrl(u: string): boolean {
   try {
@@ -95,6 +97,8 @@ function requireSecret(
   if (req.get("x-operator-secret") === workerSecret) return next();
   res.status(401).json({ error: "Missing or invalid x-operator-secret" });
 }
+
+registerMixRoutes(app, requireSecret);
 
 // Expose the recordings directory so direct file access still works
 app.use("/download/recordings", express.static(path.join(process.cwd(), "download/recordings")));
@@ -314,6 +318,12 @@ app.get("/health", async (_req, res) => {
     recorder,
   });
 });
+
+// Arm the loop registry's recurring jobs (registered at import time by
+// src/recorder.ts — the stale-job sweep). Without this the registry stays
+// un-armed and the sweep never fires, so finished job records and their
+// MP4/thumbnail files accumulate until the process restarts.
+startLoops();
 
 const port = Number(process.env.PORT) || 3000;
 app.listen(port, () => {
