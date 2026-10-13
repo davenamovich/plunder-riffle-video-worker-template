@@ -1986,15 +1986,33 @@ async function assembleStaticCardVideo(
  */
 export function computeScreencastDurationMs(
   pageInfo: PageInfoForRecording,
-  opts: { durationMs?: number; autoDuration: boolean },
+  opts: { durationMs?: number; autoDuration: boolean; narrationSec?: number },
 ): number {
   const beatMs = pageInfo.beatMs || DEFAULT_BEAT_MS;
   let durationMs = opts.durationMs || 0;
   const explicit = !opts.autoDuration && opts.durationMs;
 
+  // Speech floor: the capture window is NEVER shorter than the spoken audio
+  // it has to carry — the page's own <audio> narration AND/OR the caller's
+  // voiceover (opts.narrationSec — MP4 + VOICE rides as songUrl, so the page
+  // never sees it). Without this, a script longer than the page's declared
+  // target gets cut mid-word: the page-declared branch returned early, and
+  // the beat-heuristic branch never saw the external narration at all. The
+  // floor includes VOICE_TAIL_MS because the ffmpeg mix trims/fades exactly
+  // that much off the end — the tail must be silence, not real speech.
+  const speechFloorMs = Math.max(
+    pageInfo.audioDurationSec > 0
+      ? Math.round(pageInfo.audioDurationSec * 1000) + VOICE_TAIL_MS
+      : 0,
+    opts.narrationSec && opts.narrationSec > 0
+      ? Math.round(opts.narrationSec * 1000) + VOICE_TAIL_MS
+      : 0,
+  );
+
   if (explicit) {
-    // Caller-supplied explicit duration — pass through with sanity ceiling.
-    return Math.min(durationMs, EXPLICIT_DURATION_CAP_MS);
+    // Caller-supplied explicit duration — pass through with sanity ceiling
+    // (still floored by speech: never amputate a narration mid-sentence).
+    return Math.min(Math.max(durationMs, speechFloorMs), EXPLICIT_DURATION_CAP_MS);
   }
 
   if (opts.autoDuration && !durationMs) {
@@ -2006,7 +2024,9 @@ export function computeScreencastDurationMs(
       // explicit caller durationMs. The old cap silently truncated 3m30s
       // songs to 3:00, making /songs renders hang at 3-min then cut off.
       // The EXPLICIT_DURATION_CAP_MS (15min) still applies as a sanity guard.
-      return Math.min(pageInfo.recordDurationMs, EXPLICIT_DURATION_CAP_MS);
+      // A narration longer than the declared target EXTENDS the window
+      // instead (speech floor) — the clean ending lands after the last word.
+      return Math.min(Math.max(pageInfo.recordDurationMs, speechFloorMs), EXPLICIT_DURATION_CAP_MS);
     } else if (pageInfo.declaredBeats > 0) {
       // Every beat up to the last gets its normal per-format pace; the final
       // beat (the CTA screen) is capped at LAST_FRAME_HOLD_MS regardless of
@@ -2018,11 +2038,12 @@ export function computeScreencastDurationMs(
     } else {
       durationMs = DEFAULT_BEAT_MS * 3;
     }
-    if (pageInfo.audioDurationSec > 0) {
+    if (speechFloorMs > 0) {
       // Floor must be at least as large as the VOICE_TAIL_MS the ffmpeg mix
       // trims/fades off the end, or that trim eats into real speech instead
-      // of the silent buffer it's meant to be.
-      durationMs = Math.max(durationMs, Math.round(pageInfo.audioDurationSec * 1000) + VOICE_TAIL_MS);
+      // of the silent buffer it's meant to be. speechFloorMs already covers
+      // both the page's own audio and the caller's narration.
+      durationMs = Math.max(durationMs, speechFloorMs);
     }
   }
 
@@ -2763,9 +2784,18 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
     // Story Mode passes an explicit durationMs (measured narration length).
     const outWidth = opts.outWidth || VERTICAL_OUT_W;
     const outHeight = opts.outHeight || VERTICAL_OUT_H;
+    // Caller-supplied narration (MP4 + VOICE, /mp4 voice note): probe the
+    // resolved audio file so the capture window can be floored on the REAL
+    // spoken length — the page never declares it (the track isn't on the
+    // page), so without this a long voiceover gets cut at the page target.
+    let narrationSec = 0;
+    if (audioPath && opts.primaryAudioRole === "narration") {
+      narrationSec = (await probeDuration(audioPath)) || 0;
+    }
     const durationMs = computeScreencastDurationMs(pageInfo, {
       durationMs: opts.durationMs,
       autoDuration,
+      narrationSec,
     });
 
     // Auto-start + drive the recording: scrollable pages scroll at a
@@ -2784,7 +2814,10 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
       autoDuration,
       durationMs,
       isInteractive,
-      waitFullDuration: pageInfo.recordDurationMs > 0,
+      // Also full-window when speech floored the capture PAST the page's own
+      // target — otherwise the driver stops at the show signal and the tail
+      // that was extended for the narration never gets recorded.
+      waitFullDuration: pageInfo.recordDurationMs > 0 || narrationSec > 0,
     });
 
     const showEndMs = Date.now() - recordClockStart;
@@ -2930,7 +2963,12 @@ export function getRenderQueueStatus(): { running: number; queued: number; capac
   return { running: runningJobsCount, queued: jobQueue.length, capacity: MAX_CONCURRENT_JOBS };
 }
 
-async function probeDuration(p: string): Promise<number | null> {
+/**
+ * Real decoded duration of a media file (seconds), via `ffmpeg -i` parse.
+ * Exported for adapters that floor their capture window on the
+ * caller-supplied narration length exactly like this engine does.
+ */
+export async function probeDuration(p: string): Promise<number | null> {
   return new Promise((resolve) => {
     const { spawn } = require("child_process");
     const proc = spawn("ffmpeg", ["-i", p, "-f", "null", "-"]);
