@@ -15,6 +15,7 @@ import { randomUUID } from "crypto";
 import { mkdir, readFile, rm, writeFile, readdir, stat } from "fs/promises";
 import { tmpdir } from "os";
 import { join, resolve } from "path";
+import { withRenderSlot } from "./recorder";
 
 const ROOT = join(tmpdir(), "mix-sessions");
 const SESSION_TTL_MS = 45 * 60_000;
@@ -146,7 +147,9 @@ export function registerMixRoutes(app: Express, requireSecret: RequestHandler): 
     if (!BINS.has(base)) return void res.status(400).json({ error: "bin must be ffmpeg or ffprobe" });
     if (!argsAreContained(args, s.dir)) return void res.status(400).json({ error: "args rejected (paths must stay inside the session)" });
     const t = Math.min(Math.max(Number(timeoutMs) || 120_000, 5_000), 300_000);
-    const r = await runBin(base, args, s.dir, t);
+    // Same serialised slot as a render: these are ffmpeg processes, and running
+    // them beside a render is how the worker ran out of process slots.
+    const r = await withRenderSlot(() => runBin(base, args, s.dir, t));
     if (r.ok) return void res.json({ stdout: r.stdout });
     res.status(422).json({ error: r.error });
   });

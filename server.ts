@@ -5,7 +5,9 @@ import {
   deleteJob,
   recorderDiagnostics,
   getRenderQueueStatus,
-  resolveChromium,
+  getSharedBrowser,
+  closeSharedBrowser,
+  withRenderSlot,
   collectPageInfo,
   type RecordOptions,
 } from "./src/recorder";
@@ -233,55 +235,59 @@ app.post("/api/stills", requireSecret, async (req, res) => {
     if (!url) return res.status(400).json({ error: "url is required" });
     if (!/^https?:\/\//i.test(url)) return res.status(400).json({ error: "url must be a public http(s) URL" });
 
-    const { chromium, devices } = await import("playwright-core");
-    const vp = { width: 540, height: 960 };
-    const browser = await chromium.launch({
-      headless: true,
-      executablePath: resolveChromium(),
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+    // Queued in the SAME single slot as a render, on the SAME shared Chromium.
+    // This endpoint used to launch its own browser beside a running render,
+    // which is how the worker ran out of process slots (`spawn … EAGAIN`).
+    const captured = await withRenderSlot(async () => {
+      const { devices } = await import("playwright-core");
+      const vp = { width: 540, height: 960 };
+      const browser = await getSharedBrowser();
+      let ctx: any = null;
+      try {
+        ctx = await browser.newContext({
+          ...devices["iPhone 14"],
+          viewport: vp,
+          deviceScaleFactor: 2,
+          reducedMotion: "reduce" as const,
+        });
+        const page = await ctx.newPage();
+        const pageUrl = new URL(url);
+        pageUrl.searchParams.set("mode", "frame");
+        await page.goto(pageUrl.toString(), { waitUntil: "load", timeout: 30_000 }).catch(() => {});
+        await page.evaluate(() => (document as any).fonts?.ready).catch(() => {});
+        await page.waitForFunction(() => (window as any).__vessel?.ready === true, { timeout: 10_000 }).catch(() => {});
+
+        const pageInfo = await collectPageInfo(page);
+        if (pageInfo.beatCount < 1) {
+          return { error: "No beats found on page — not a vessel slideshow" };
+        }
+        const msgCount = pageInfo.hasLanding
+          ? Math.max(0, pageInfo.vesselBeatCount - pageInfo.beatCount - 1)
+          : 0;
+        const ctaFrame = pageInfo.beatCount + msgCount + 1;
+
+        const frames: Array<{ index: number; dataUrl: string }> = [];
+        for (let i = 0; i < pageInfo.beatCount; i++) {
+          const n = msgCount + 1 + i;
+          await page.evaluate((idx: number) => (window as any).__vessel?.setBeat(idx), n).catch(() => {});
+          await page.waitForTimeout(i === 0 ? 1400 : 1000);
+          const buf = await page.screenshot({ type: "png" });
+          frames.push({ index: i, dataUrl: `data:image/png;base64,${buf.toString("base64")}` });
+        }
+        await page.evaluate((idx: number) => (window as any).__vessel?.setBeat(idx), ctaFrame).catch(() => {});
+        await page.waitForTimeout(1000);
+        const ctaBuf = await page.screenshot({ type: "png" });
+        frames.push({ index: pageInfo.beatCount, dataUrl: `data:image/png;base64,${ctaBuf.toString("base64")}` });
+
+        console.log(`[worker] stills captured: ${pageInfo.beatCount} beats → ${frames.length} frames from ${url.slice(0, 80)}`);
+        return { beatCount: pageInfo.beatCount, slideCount: frames.length, frames };
+      } finally {
+        // Shared browser — close only this capture's context.
+        if (ctx) await ctx.close().catch(() => {});
+      }
     });
-    try {
-      const ctx = await browser.newContext({
-        ...devices["iPhone 14"],
-        viewport: vp,
-        deviceScaleFactor: 2,
-        reducedMotion: "reduce" as const,
-      });
-      const page = await ctx.newPage();
-      const pageUrl = new URL(url);
-      pageUrl.searchParams.set("mode", "frame");
-      await page.goto(pageUrl.toString(), { waitUntil: "load", timeout: 30_000 }).catch(() => {});
-      await page.evaluate(() => (document as any).fonts?.ready).catch(() => {});
-      await page.waitForFunction(() => (window as any).__vessel?.ready === true, { timeout: 10_000 }).catch(() => {});
-
-      const pageInfo = await collectPageInfo(page);
-      if (pageInfo.beatCount < 1) {
-        return res.status(422).json({ error: "No beats found on page — not a vessel slideshow" });
-      }
-      const msgCount = pageInfo.hasLanding
-        ? Math.max(0, pageInfo.vesselBeatCount - pageInfo.beatCount - 1)
-        : 0;
-      const ctaFrame = pageInfo.beatCount + msgCount + 1;
-
-      const frames: Array<{ index: number; dataUrl: string }> = [];
-      for (let i = 0; i < pageInfo.beatCount; i++) {
-        const n = msgCount + 1 + i;
-        await page.evaluate((idx: number) => (window as any).__vessel?.setBeat(idx), n).catch(() => {});
-        await page.waitForTimeout(i === 0 ? 1400 : 1000);
-        const buf = await page.screenshot({ type: "png" });
-        frames.push({ index: i, dataUrl: `data:image/png;base64,${buf.toString("base64")}` });
-      }
-      await page.evaluate((idx: number) => (window as any).__vessel?.setBeat(idx), ctaFrame).catch(() => {});
-      await page.waitForTimeout(1000);
-      const ctaBuf = await page.screenshot({ type: "png" });
-      frames.push({ index: pageInfo.beatCount, dataUrl: `data:image/png;base64,${ctaBuf.toString("base64")}` });
-
-      await ctx.close().catch(() => {});
-      console.log(`[worker] stills captured: ${pageInfo.beatCount} beats → ${frames.length} frames from ${url.slice(0, 80)}`);
-      res.json({ beatCount: pageInfo.beatCount, slideCount: frames.length, frames });
-    } finally {
-      await browser.close().catch(() => {});
-    }
+    if ("error" in captured) return res.status(422).json({ error: captured.error });
+    res.json(captured);
   } catch (err) {
     console.error("[worker] stills capture failed:", (err as Error).message);
     res.status(500).json({ error: "stills capture failed" });
@@ -324,6 +330,14 @@ app.get("/health", async (_req, res) => {
 // un-armed and the sweep never fires, so finished job records and their
 // MP4/thumbnail files accumulate until the process restarts.
 startLoops();
+
+// Stop Chromium with the process. Railway sends SIGTERM on redeploy, and an
+// orphaned headless shell is exactly the leak this worker cannot afford.
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.on(signal, () => {
+    void closeSharedBrowser().finally(() => process.exit(0));
+  });
+}
 
 const port = Number(process.env.PORT) || 3000;
 app.listen(port, () => {

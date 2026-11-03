@@ -51,6 +51,7 @@ import { randomUUID } from "crypto";
 import { getEnv, isEnvTrue } from "./worker-env";
 // === worker-only END: env readers ===
 import { createRequestGuard } from "./ssrf";
+import { x264LeanArgs } from "./x264-args";
 import { registerLoop } from "./loop-registry";
 
 // ΓöÇΓöÇ Types ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -276,6 +277,21 @@ export function staticCardDurationMs(): number {
   const raw = Number(getEnv("RECORD_STATIC_CARD_MS"));
   return Math.min(60_000, Math.max(3_000, Number.isFinite(raw) && raw > 0 ? raw : 8_000));
 }
+
+/**
+ * How long the static-card fast path should hold the settled frame.
+ *
+ * The page's own `VESSEL.staticCardMs` wins when it declares one — a format
+ * that knows its on-screen length (the reply card's 7s) should not inherit the
+ * generic still-meme hold — otherwise RECORD_STATIC_CARD_MS applies. Bounded
+ * like the env override (3–60s) so a bad declaration can't ship a 1s or a
+ * 10-minute card.
+ */
+export function staticCardTargetMs(pageInfo: { staticCardMs?: number }): number {
+  const declared = Number(pageInfo.staticCardMs) || 0;
+  if (declared > 0) return Math.min(60_000, Math.max(3_000, Math.round(declared)));
+  return staticCardDurationMs();
+}
 /**
  * Animated memes are looped for durSec + 2×this, then this much is cut off the
  * front and the back — the first/last moments of a GIF/video loop (and any
@@ -294,11 +310,18 @@ const VOICED_CARD_FADE_OUT_SEC = 0.4;
  * Does this page qualify for the static-card fast path? Pure + exported so
  * the gate stays unit-testable.
  *
- * Criteria: the page declares itself a single settled composition (VESSEL
- * beats=1 / recordDurationMs baked) AND actually has zero beat/card DOM (a
+ * Criteria: the page EXPLICITLY opts in (VESSEL.staticCard=true — only the
+ * single-page meme builders set it) AND actually has zero beat/card DOM (a
  * miscount must not hijack real decks) AND has no audio (a page with sound
  * needs the screencast path's audio mix) AND the caller isn't overlaying a
  * song/narration (same reason).
+ *
+ * The legacy inference ("1 declared beat + vessel hook ⇒ static card") is
+ * GONE: it fast-pathed every page that happened to end up with one beat —
+ * short iMessage threads, 1-segment compilations, half-loaded decks — to
+ * the ~8s card, which is exactly the "everything records like a single
+ * page meme" regression. beats:1 alone no longer qualifies; a page must flag
+ * itself.
  */
 export function isStaticCardPage(
   pageInfo: PageInfoForRecording,
@@ -307,10 +330,8 @@ export function isStaticCardPage(
   if (opts.hasMixAudio) return false;
   if (pageInfo.appslidesVessel) return false;
   if (pageInfo.audioSrc || pageInfo.musicSrc || pageInfo.audioDurationSec > 0) return false;
-  // Static-card requires the EXPLICIT VESSEL.staticCard=true opt-in from the
-  // page builder — never infer it from beat counts (that inference
-  // fast-pathed every 1-beat page to the ~8s card: the
-  // treat-everything-like-a-single-page-meme regression).
+  // Static-card requires the EXPLICIT opt-in from the page builder — never
+  // infer it from beat counts (that's the treat-everything-as-a-meme bug).
   // An explicit multi-beat declaration is still authoritative even when the
   // page flags itself — a misdeclared/miscounted deck must never fast-path.
   if (pageInfo.declaredBeats > 1) return false;
@@ -377,6 +398,89 @@ export function resolveChromium(): string | undefined {
     if (existsSync(p)) return p;
   }
   return undefined;
+}
+
+/**
+ * The one Chromium every render in this process shares.
+ *
+ * Launching a fresh browser per job is what pushes a busy worker into
+ * `spawn … EAGAIN`: one headless shell is a main process plus its zygote and
+ * utility children, and rendering back-to-back duplicated that whole tree per
+ * job (and again per still capture) until the container had no process slots
+ * left. One launch, reused, keeps the process count flat. Isolation is
+ * unchanged — every job still gets its own BrowserContext, which is where
+ * cookies, storage and the video recording live.
+ *
+ * A failed launch is deliberately not cached: the slot is cleared so the next
+ * job tries again instead of every job inheriting the first error. A browser
+ * that dies mid-render (crash, OOM kill) is caught by isConnected() and
+ * replaced on the next call.
+ */
+const SHARED_BROWSER_ARGS = [
+  "--no-sandbox",
+  "--disable-setuid-sandbox",
+  "--disable-dev-shm-usage",
+  "--disable-gpu",
+  "--mute-audio",
+  "--autoplay-policy=no-user-gesture-required",
+  "--font-render-hinting=none",
+];
+
+let sharedBrowser: Promise<any> | null = null;
+
+/**
+ * Launch a Chromium and cache the PROMISE, synchronously, before the dynamic
+ * import yields. Caching the promise (not the finished browser) is what stops
+ * two jobs that ask at the same moment from launching two browsers. A failed
+ * launch clears the cache so the next job retries instead of inheriting the
+ * error; a browser that disconnects later clears it too.
+ */
+function launchSharedBrowser(): Promise<any> {
+  const pending = (async () => {
+    const { chromium } = await import("playwright-core");
+    return chromium.launch({
+      headless: true,
+      executablePath: resolveChromium(),
+      args: SHARED_BROWSER_ARGS,
+    });
+  })();
+  sharedBrowser = pending;
+  void pending
+    .then((b: any) => {
+      b.once("disconnected", () => {
+        if (sharedBrowser === pending) sharedBrowser = null;
+      });
+    })
+    .catch(() => {
+      if (sharedBrowser === pending) sharedBrowser = null;
+    });
+  return pending;
+}
+
+/** The shared Chromium, launched on first use (or relaunched if it died). */
+export function getSharedBrowser(retries = 1): Promise<any> {
+  if (!sharedBrowser) launchSharedBrowser();
+  const pending = sharedBrowser as Promise<any>;
+  return pending.then((b: any) => {
+    if (b.isConnected()) return b;
+    // It died between launch and use — forget it and start a fresh one.
+    if (sharedBrowser === pending) sharedBrowser = null;
+    if (retries <= 0) throw new Error("Chromium launched but was not connected");
+    return getSharedBrowser(retries - 1);
+  });
+}
+
+/**
+ * Close the shared browser and forget it. Used by an abandoned render (closing
+ * the browser is the only way to stop a page wedged inside a Playwright wait)
+ * and by process shutdown.
+ */
+export async function closeSharedBrowser(): Promise<void> {
+  const pending = sharedBrowser;
+  sharedBrowser = null;
+  if (!pending) return;
+  const browser = await pending.catch(() => null);
+  if (browser) await browser.close().catch(() => {});
 }
 
 /**
@@ -473,23 +577,28 @@ function ffmpegTimeoutMs(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : 300_000;
 }
 
+// Memory-lean x264 settings live in ./x264-args so the /sitdown clip
+// normaliser (sitdown-lead.ts) encodes with the same caps as the recorder.
+export { x264LeanArgs } from "./x264-args";
+
 /**
- * Memory-lean x264 settings. `-threads 0` + `-preset fast` (rc-lookahead 30,
- * one frame-thread per core) makes x264's peak RSS scale with core count and
- * the 1080x1920 blur-composite graph; on a memory-capped container that ends
- * in a kernel OOM SIGKILL mid-encode (seen ~1:25 into a 1:30+ render).
- * veryfast + short lookahead + few threads costs a little file size but keeps
- * the peak flat. Override thread count with RECORD_FFMPEG_THREADS.
+ * Every ffmpeg child this process currently has running. The watchdog kills
+ * these when it abandons a render — otherwise a wedged encode keeps a process
+ * (and the memory it holds) alive for the next job to trip over.
  */
-export function x264LeanArgs(crf = 28): string[] {
-  const t = Number(getEnv("RECORD_FFMPEG_THREADS"));
-  const threads = Number.isFinite(t) && t > 0 ? Math.floor(t) : 2;
-  return [
-    "-c:v", "libx264", "-preset", "veryfast", "-crf", String(crf),
-    "-x264-params", `rc-lookahead=10:ref=2:bframes=2:threads=${threads}:lookahead-threads=1`,
-    "-threads", String(threads),
-    "-filter_complex_threads", "1",
-  ];
+const activeEncodes = new Set<any>();
+
+/** SIGKILL every running ffmpeg. Returns how many were signalled. */
+export function killActiveEncodes(): number {
+  let killed = 0;
+  for (const p of activeEncodes) {
+    try {
+      p.kill("SIGKILL");
+      killed++;
+    } catch {}
+  }
+  activeEncodes.clear();
+  return killed;
 }
 
 /**
@@ -505,6 +614,7 @@ export function runFfmpeg(args: string[]): Promise<void> {
       stdio: ["ignore", "pipe", "pipe"],
       shell: process.platform === "win32",
     });
+    activeEncodes.add(ffmpeg);
     const limitMs = ffmpegTimeoutMs();
     let timedOut = false;
     const killer = setTimeout(() => {
@@ -518,6 +628,7 @@ export function runFfmpeg(args: string[]): Promise<void> {
       if (stderrChunks.length > 300) stderrChunks.shift();
     });
     ffmpeg.on("close", (code, signal) => {
+      activeEncodes.delete(ffmpeg);
       clearTimeout(killer);
       const fullStderr = Buffer.concat(stderrChunks).toString();
       if (process.env.DEBUG_FFMPEG) {
@@ -558,6 +669,7 @@ export function runFfmpeg(args: string[]): Promise<void> {
       reject(new Error(`FFmpeg exited ${code}: ${stderr}`));
     });
     ffmpeg.on("error", (e) => {
+      activeEncodes.delete(ffmpeg);
       clearTimeout(killer);
       reject(e);
     });
@@ -737,6 +849,7 @@ function runFfmpegCapture(args: string[]): Promise<Buffer> {
       stdio: ["ignore", "pipe", "pipe"],
       shell: process.platform === "win32",
     });
+    activeEncodes.add(ffmpeg);
     // Same reasoning as runFfmpeg: a probe that hangs would pin the render slot.
     const limitMs = ffmpegTimeoutMs();
     let timedOut = false;
@@ -753,6 +866,7 @@ function runFfmpegCapture(args: string[]): Promise<Buffer> {
       if (errChunks.length > 100) errChunks.shift();
     });
     ffmpeg.on("close", (code, signal) => {
+      activeEncodes.delete(ffmpeg);
       clearTimeout(killer);
       if (timedOut) {
         const tail = Buffer.concat(errChunks).toString().slice(-1500);
@@ -773,6 +887,7 @@ function runFfmpegCapture(args: string[]): Promise<Buffer> {
       reject(new Error(`FFmpeg exited ${code}: ${Buffer.concat(errChunks).toString().slice(-1500)}`));
     });
     ffmpeg.on("error", (e) => {
+      activeEncodes.delete(ffmpeg);
       clearTimeout(killer);
       reject(e);
     });
@@ -1220,8 +1335,20 @@ export interface PageInfoForRecording {
   ctaIndex: number;
   /** Page explicitly opts in to the static-card fast path (single-page memes
    *  set VESSEL.staticCard=true). Required gate: a page that merely ends up
-   *  with 1 beat must NEVER shortcut to the ~8s card. */
+   *  with 1 beat (a short iMessage thread, a 1-beat slideshow, a compilation
+   *  with one segment) must NEVER shortcut to the ~8s card — legacy deploys
+   *  did exactly that and "treated everything like a single page meme". */
   staticCard: boolean;
+  /**
+   * Target length (ms) for the static-card fast path, declared by the page as
+   * `VESSEL.staticCardMs`. Absent/0 = RECORD_STATIC_CARD_MS (see
+   * staticCardTargetMs). Lets a format that knows how long its card should be
+   * on screen (the reply card's 7s) say so instead of inheriting the generic
+   * ~8s still-meme hold.
+   */
+  staticCardMs?: number;
+  /** Poster moment (s into the show) the page asks for, from `VESSEL.posterMs`: a cover that is gone by the 1.0s default. */
+  posterSec?: number;
 }
 
 export async function collectPageInfo(page: any): Promise<PageInfoForRecording> {
@@ -1292,6 +1419,8 @@ export async function collectPageInfo(page: any): Promise<PageInfoForRecording> 
         ctaMs: Number(vessel.ctaMs) || 0,
         ctaIndex: Number.isFinite(Number(vessel.ctaIndex)) ? Number(vessel.ctaIndex) : -1,
         staticCard: vessel.staticCard === true || vesselHook.staticCard === true,
+        staticCardMs: Number(vessel.staticCardMs) || Number(vesselHook.staticCardMs) || 0,
+        posterSec: (Number(vessel.posterMs) || 0) / 1000,
       };
     })
     .catch(() => ({
@@ -1310,6 +1439,7 @@ export async function collectPageInfo(page: any): Promise<PageInfoForRecording> 
       ctaMs: 0,
       ctaIndex: -1,
       staticCard: false,
+      staticCardMs: 0,
     }));
 }
 
@@ -1476,15 +1606,14 @@ export async function captureSlideshowStillFrames(
   pageUrl: string,
   opts: { viewport?: { width: number; height: number } } = {},
 ): Promise<Buffer[]> {
-  const { chromium, devices } = await import("playwright-core");
+  const { devices } = await import("playwright-core");
   const vp = opts.viewport || { width: 540, height: 960 }; // ×2 supersample = 1080×1920, matches appslides output
-  const browser = await chromium.launch({
-    headless: true,
-    executablePath: resolveChromium(),
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--mute-audio"],
-  });
+  // Shared Chromium: a still capture must not launch a second browser tree
+  // beside a running render (see getSharedBrowser). Isolation is per context.
+  const browser = await getSharedBrowser();
+  let ctx: any = null;
   try {
-    const ctx = await browser.newContext({
+    ctx = await browser.newContext({
       ...devices["iPhone 14"],
       viewport: vp,
       deviceScaleFactor: SUPERSAMPLE,
@@ -1554,7 +1683,8 @@ export async function captureSlideshowStillFrames(
     await ctx.close().catch(() => {});
     return frames;
   } finally {
-    await browser.close().catch(() => {});
+    // Shared browser — close only this capture's context.
+    if (ctx) await ctx.close().catch(() => {});
   }
 }
 
@@ -2154,6 +2284,8 @@ export function computeScreencastTrim(input: {
    *  Mode's <audio id="bgm">). Suppresses the opening frame hold so the
    *  video and the narration stay in lock-step. */
   hasVoice?: boolean;
+  /** The page's own poster moment (s); replaces the interactive 1.0s default. Floored at 0.35 so the poster stamp runs. */
+  posterSec?: number;
 }): ScreencastTrimResult {
   const totalRecordedSec = Math.max(0.5, input.showEndMs / 1000);
   const videoLenSec = input.videoLenSec ?? totalRecordedSec;
@@ -2177,7 +2309,7 @@ export function computeScreencastTrim(input: {
       showDurSec: Math.min(targetDurSec, maxAvailableSec),
       // Poster moment after the entrance fade so the thumbnail isn't a dark
       // just-started frame (the page's title fades in over ~0.65s).
-      thumbSec: 1.0,
+      thumbSec: input.posterSec && input.posterSec > 0 ? Math.max(0.35, input.posterSec) : 1.0,
     };
   }
 
@@ -2223,6 +2355,8 @@ export interface ComposeScreencastInput {
   /** True if the page drives its own animations (slideshow/imessage). 
    *  Disables the initial frame hold so the video doesn't look like a static picture. */
   isInteractive?: boolean;
+  /** The page's own poster moment in seconds (`VESSEL.posterMs`). */
+  posterSec?: number;
   /** True if the video duration automatically matched the audio */
   autoDuration?: boolean;
   /** Output canvas dims — default 1080×1920 (legacy 9:16). Story Mode passes
@@ -2413,6 +2547,7 @@ export async function composeScreencastToMp4(
     videoLenSec: probedSec,
     isInteractive: input.isInteractive === true,
     hasVoice: !!audioPath && input.primaryAudioRole === "narration",
+    posterSec: input.posterSec,
   });
   const { startSec, holdSec, showDurSec, thumbSec } = trim;
 
@@ -2537,16 +2672,15 @@ export async function composeScreencastToMp4(
       : phoneCropFilter(viewport.width, viewport.height, outWidth, outHeight);
   const thumb = await makeThumbnail(mp4Path, thumbPath, thumbSec, thumbCrop);
   await stampPosterFrame(mp4Path, thumbSec);
-  
   return { durationMs: Math.round(showDurSec * 1000), thumbnailPath: thumb };
 }
 
 async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult> {
   // Lazy import playwright-core so the module loads fine even if the package
   // is not installed (graceful degradation when the feature isn't available).
-  let chromium: any, devices: any;
+  let devices: any;
   try {
-    ({ chromium, devices } = await import("playwright-core"));
+    ({ devices } = await import("playwright-core"));
   } catch {
     throw new Error("playwright-core is not installed. Run: npm install playwright-core");
   }
@@ -2564,22 +2698,17 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
 
   const baseUrl = (getEnv("PUBLIC_BASE_URL") || "http://localhost:8080").replace(/\/$/, "");
 
-  const browser = await chromium.launch({
-    headless: true,
-    executablePath: resolveChromium(),
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--mute-audio",
-      "--autoplay-policy=no-user-gesture-required",
-      "--font-render-hinting=none",
-    ],
-  });
+  // One shared Chromium for the whole process (see getSharedBrowser) — a fresh
+  // launch per render is what exhausted the container's process slots.
+  const browser = await getSharedBrowser();
+
+  // Hoisted out of the try so the finally can close THIS job's context on every
+  // exit path: with a shared browser there is no browser.close() safety net, so
+  // a failed render must not leave a context (and its renderer) behind.
+  let context: any = null;
 
   try {
-    const context = await browser.newContext({
+    context = await browser.newContext({
       ...devices["iPhone 14"],
       screen: { width: viewport.width, height: viewport.height },
       viewport: { width: viewport.width, height: viewport.height },
@@ -2702,13 +2831,13 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
     // video ends right after the hook instead of a fixed 8s with dead air.
     const narrationOnly = !!audioPath && !musicPath && opts.primaryAudioRole === "narration";
     if (isStaticCardPage(pageInfo, { hasMixAudio: !!musicPath || (!!audioPath && !narrationOnly) })) {
-      console.log(`[recorder] Static-card fast path — single settled frame, ${narrationOnly ? "voiced" : staticCardDurationMs() + "ms"}`);
+      console.log(`[recorder] Static-card fast path — single settled frame, ${narrationOnly ? "voiced" : staticCardTargetMs(pageInfo) + "ms"}`);
       await page.close().catch(() => {});
       await context.close().catch(() => {});
 
       const outWidth = opts.outWidth || VERTICAL_OUT_W;
       const outHeight = opts.outHeight || VERTICAL_OUT_H;
-      let durSec = staticCardDurationMs() / 1000;
+      let durSec = staticCardTargetMs(pageInfo) / 1000;
       if (narrationOnly) {
         // Voice length + a short silent tail that holds the card; fades land in the tail.
         const voiceSec = await probeDuration(audioPath as string);
@@ -2825,12 +2954,13 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
 
     await page.close();
     await context.close(); // triggers Playwright to flush the .webm
-    // Free Chromium BEFORE the encode. The .webm is flushed and the browser is
-    // never used again; x264's lookahead buffers + Chromium's resident set
+    // Free the CAPTURE before the encode. The .webm is flushed and this job's
+    // page is gone; x264's lookahead buffers + a live screencast renderer
     // together push the container over its memory limit mid-encode, and the
-    // kernel OOM-kill lands on ffmpeg as "FFmpeg exited null" (SIGKILL, no
-    // exit code) — exactly what production hit on a long screencast.
-    await browser.close().catch(() => {});
+    // kernel OOM-kill lands on ffmpeg as "FFmpeg exited null" (SIGKILL, no exit
+    // code) — exactly what production hit on a long screencast. Closing the
+    // context releases that renderer; the browser itself stays warm with no
+    // page open, so the next render does not spawn a whole Chromium tree.
 
     // Find the .webm written by Playwright.
     const webmFiles = (await readdir(workDir)).filter((f) => f.endsWith(".webm"));
@@ -2862,6 +2992,7 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
       // held opening frame on the wrong point in the webm.
       isInteractive:
         pageInfo.beatCount > 0 || pageInfo.vesselBeatCount > 0 || pageInfo.isInteractive,
+      posterSec: pageInfo.posterSec,
       autoDuration,
       outWidth,
       outHeight,
@@ -2890,7 +3021,10 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
       viewport: { width: viewport.width, height: viewport.height, name: viewport.name },
     };
   } finally {
-    await browser.close().catch(() => {}); // no-op when closed before the encode
+    // The browser is shared and outlives this job — only this job's context is
+    // ours to close. Every fast path above closes it already; this covers the
+    // error paths that used to rely on browser.close() doing it for them.
+    if (context) await context.close().catch(() => {});
   }
 }
 
@@ -2958,6 +3092,35 @@ function releaseJobSlot(): void {
   }
 }
 
+/**
+ * Stop whatever this process is rendering: close the shared browser and kill
+ * every running ffmpeg. Called by the job watchdog when a render blows its time
+ * limit — closing the browser is the only way to abort a page stuck inside a
+ * Playwright wait, and its encodes have to go with it.
+ */
+export async function abortActiveRenders(): Promise<void> {
+  const encodes = killActiveEncodes();
+  await closeSharedBrowser();
+  if (encodes > 0) {
+    console.warn(`[recorder] killed ${encodes} ffmpeg process(es) along with the abandoned render`);
+  }
+}
+
+/**
+ * Run work that also needs Chromium or FFmpeg (a still capture, an /api/mix
+ * encode) inside the same serialised slot as a render. Without this those
+ * endpoints launched their own browser or ffmpeg beside a running render, and
+ * the container ran out of process slots — `spawn … EAGAIN` on the next launch.
+ */
+export async function withRenderSlot<T>(fn: () => Promise<T>): Promise<T> {
+  await acquireJobSlot(`aux-${randomUUID()}`);
+  try {
+    return await fn();
+  } finally {
+    releaseJobSlot();
+  }
+}
+
 /** Live queue depth — surfaced by /api/record so the UI can show the backlog. */
 export function getRenderQueueStatus(): { running: number; queued: number; capacity: number } {
   return { running: runningJobsCount, queued: jobQueue.length, capacity: MAX_CONCURRENT_JOBS };
@@ -2965,13 +3128,17 @@ export function getRenderQueueStatus(): { running: number; queued: number; capac
 
 /**
  * Real decoded duration of a media file (seconds), via `ffmpeg -i` parse.
- * Exported for adapters that floor their capture window on the
- * caller-supplied narration length exactly like this engine does.
+ * Exported for the Browserless adapter, which floors its capture window on
+ * the caller-supplied narration length exactly like this engine does.
  */
 export async function probeDuration(p: string): Promise<number | null> {
   return new Promise((resolve) => {
     const { spawn } = require("child_process");
-    const proc = spawn("ffmpeg", ["-i", p, "-f", "null", "-"]);
+    // Use the same resolved ffmpeg as every encode — a worker with FFMPEG_PATH
+    // set (not on PATH) would otherwise fail this probe, return null, and
+    // silently drop the narration floor that keeps a voiceover from being cut.
+    const proc = spawn(resolveFfmpeg(), ["-i", p, "-f", "null", "-"]);
+    proc.on("error", () => resolve(null));
     let out = "";
     proc.stderr.on("data", (d: Buffer) => (out += d));
     proc.on("close", () => {
@@ -3061,27 +3228,33 @@ export async function runJob(opts: RecordOptions, runner: JobRunner): Promise<Jo
     }, 500);
     if ((ticker as any).unref) (ticker as any).unref();
 
-    // Watchdog: the slot is released the moment this fires, whether or not
-    // recordPage ever settles. FFmpeg has its own SIGKILL timeout, and
-    // recordPage closes the browser in its own finally, so an abandoned job
-    // winds itself down instead of leaking a Chromium into the container.
+    // Watchdog: a render that blows its ceiling is stopped, not just forgotten.
+    // It used to only reject the race, which freed the slot while the abandoned
+    // render kept its Chromium and ffmpeg running — the next job then launched
+    // a second browser beside the zombie until the container could not fork at
+    // all (`spawn … EAGAIN`). Now it closes the shared browser (aborting any
+    // stuck page), kills the encode, and holds the slot until the abandoned
+    // render has settled (see the finally below).
     // Story Mode passes its own timeoutMs (capture is real-time for a 5–6 min
     // video, plus encode — more than the 8-minute default).
     const limitMs = opts.timeoutMs || jobTimeoutMs();
     let watchdog: ReturnType<typeof setTimeout> | null = null;
+    let abandoned = false;
     const guarded = new Promise<never>((_, reject) => {
-      watchdog = setTimeout(
-        () => reject(new Error(`Render exceeded ${Math.round(limitMs / 1000)}s and was abandoned`)),
-        limitMs,
-      );
+      watchdog = setTimeout(() => {
+        abandoned = true;
+        void abortActiveRenders().catch(() => {});
+        reject(new Error(`Render exceeded ${Math.round(limitMs / 1000)}s and was abandoned`));
+      }, limitMs);
       if ((watchdog as any).unref) (watchdog as any).unref();
     });
 
+    const render = runner(opts, id);
     try {
       // Pass the job id through so result.id === job.id (callers use the job
       // id for retainRecording/deleteJob ΓÇö keeping them aligned avoids the
       // classic "delete the wrong key" footgun).
-      const result = await Promise.race([runner(opts, id), guarded]);
+      const result = await Promise.race([render, guarded]);
       const j = jobs.get(id);
       if (j) {
         j.status = "done";
@@ -3106,6 +3279,20 @@ export async function runJob(opts: RecordOptions, runner: JobRunner): Promise<Jo
     } finally {
       clearInterval(ticker);
       if (watchdog) clearTimeout(watchdog);
+      // An abandoned render is still unwinding (its browser was just closed).
+      // Handing the slot over now would let the next job start while this one
+      // still holds processes, which is exactly how the queue piled up broken
+      // Chromiums. Wait for it to settle — bounded, so a render that ignores
+      // the kill cannot block the queue forever.
+      if (abandoned) {
+        await Promise.race([
+          render.catch(() => {}),
+          new Promise((settle) => {
+            const t = setTimeout(settle, 15_000);
+            if ((t as any).unref) (t as any).unref();
+          }),
+        ]);
+      }
       release();
     }
   })();
