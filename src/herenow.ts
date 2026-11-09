@@ -162,8 +162,8 @@ export async function publishMp4ToHereNow(
 <style>
   html,body{margin:0;background:#000;height:100%;display:flex;align-items:center;justify-content:center;overflow:hidden;font-family:sans-serif;}
   body{padding:12px;box-sizing:border-box}
-  .video-container { position: relative; max-width: 100%; max-height: 92vh; border-radius: 18px; box-shadow: 0 12px 40px rgba(0,0,0,.5); overflow: hidden; background:#111; }
-  video{ width: 100%; height: 100%; display: block; }
+  .video-container { position: relative; aspect-ratio: 9 / 16; height: 92vh; max-height: 92vh; max-width: 100%; border-radius: 18px; box-shadow: 0 12px 40px rgba(0,0,0,.5); overflow: hidden; background:#111; }
+  video{ width: 100%; height: 100%; display: block; object-fit: contain; background:#000; }
   
   .overlay { 
     position: absolute; inset: 0; background: rgba(0,0,0,0.4); display: flex; 
