@@ -40,7 +40,7 @@
  */
 import { spawn, spawnSync } from "child_process";
 import { mkdir, stat, unlink, readdir, writeFile, open, rename, rm } from "fs/promises";
-import { existsSync, readdirSync, mkdirSync, writeFileSync, renameSync, readFileSync, unlinkSync } from "fs";
+import { existsSync, readdirSync, mkdirSync, writeFileSync, renameSync, readFileSync, unlinkSync, statSync } from "fs";
 import { tmpdir, homedir } from "os";
 import { join } from "path";
 import { randomUUID } from "crypto";
@@ -2724,7 +2724,14 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
   const aspectRatio = opts.aspectRatio || "9:16";
   const autoDuration = opts.autoDuration !== false;
 
-  const baseUrl = (getEnv("PUBLIC_BASE_URL") || "http://localhost:8080").replace(/\/$/, "");
+  const baseUrl = (
+    getEnv("PUBLIC_BASE_URL") ||
+    // Fall back to the port this worker actually listens on. A hardcoded
+    // localhost:8080 handed the bot a dead URL whenever the worker ran
+    // anywhere else, and the failure looked like a broken download, not a
+    // wrong port.
+    `http://127.0.0.1:${getEnv("PORT") || "8080"}`
+  ).replace(/\/$/, "");
 
   // One shared Chromium for the whole process (see getSharedBrowser) — a fresh
   // launch per render is what exhausted the container's process slots.
@@ -3367,9 +3374,18 @@ export async function recorderDiagnostics(): Promise<{
 // Sweep completed/errored jobs older than 1 hour so the Map never grows
 // without bound. Active jobs (status='recording') are never evicted.
 
-const JOB_TTL_MS = 60 * 60 * 1000; // 1 hour
+// How long a finished job and its MP4/thumbnail survive on disk. These files are
+// transient by design: the page being recorded is a temporary Cloudflare page,
+// the MP4 is fetched once and sent on to Telegram/socials, and the file is then
+// dead weight. Nothing here needs a persistent volume — only the job JSON under
+// JOBS_DIR has to outlive a restart. Sweep deletes mp4 + thumbnail + json.
+const JOB_TTL_MS =
+  Number(process.env.RECORD_MP4_TTL_MS) || 60 * 60 * 1000; // 1 hour
 
-function sweepStaleJobs(): void {
+
+// Exported so ops can clear finished jobs on demand (and so the deletion path
+// is testable without waiting for the 15-minute tick).
+export function sweepStaleJobs(): void {
   const now = Date.now();
   for (const [id, job] of jobs) {
     if (job.status === "recording" || job.status === "queued") continue; // never evict in-flight jobs
@@ -3389,6 +3405,51 @@ function sweepStaleJobs(): void {
         /* already gone ΓÇö fine */
       }
       jobs.delete(id);
+    }
+  }
+
+  // Persisted jobs survive a process restart but are only rehydrated on demand,
+  // so the in-memory Map above can be empty while stale JSON/MP4/thumbnail files
+  // remain on disk. Sweep those on-disk records too.
+  let entries: string[];
+  try {
+    entries = readdirSync(JOBS_DIR);
+  } catch {
+    return; // dir missing ΓÇö nothing persisted to sweep
+  }
+  for (const entry of entries) {
+    if (!entry.endsWith(".json")) continue;
+    const jsonPath = join(JOBS_DIR, entry);
+    let job: JobRecord;
+    try {
+      job = JSON.parse(readFileSync(jsonPath, "utf8")) as JobRecord;
+    } catch {
+      continue; // unparsable ΓÇö leave it alone
+    }
+    if (job.status === "recording" || job.status === "queued") continue;
+    if (job.retain) continue;
+    let finishedAt = job.finishedAt ? new Date(job.finishedAt).getTime() : 0;
+    if (!finishedAt) {
+      try {
+        finishedAt = statSync(jsonPath).mtimeMs;
+      } catch {
+        continue;
+      }
+    }
+    if (now - finishedAt <= JOB_TTL_MS) continue;
+    if (job.result?.mp4Path) {
+      unlink(job.result.mp4Path).catch(() => {});
+    }
+    if (job.result?.thumbnailPath) {
+      unlink(job.result.thumbnailPath).catch(() => {});
+    }
+    try {
+      unlinkSync(jsonPath);
+    } catch {
+      /* already gone ΓÇö fine */
+    }
+    if (job.id) {
+      jobs.delete(job.id);
     }
   }
 }

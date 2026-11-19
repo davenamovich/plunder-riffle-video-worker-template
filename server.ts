@@ -90,12 +90,29 @@ async function ensurePublished(jobId: string): Promise<void> {
 // thumbnail stay open: job ids are unguessable UUIDs and the bot's MP4 fetch
 // (fetchMp4Buffer) carries no headers, so guarding them would 401 every render.
 const workerSecret = process.env["WORKER_SECRET"] || "";
+
+// A bot running on the SAME instance reaches the worker over loopback
+// (RECORD_API_URL=http://127.0.0.1:8099). There is no cross-tenant boundary to
+// police there and no way to hand a Railway-style shared secret to another
+// container, so loopback is trusted outright. The guard still applies to
+// anything arriving over a non-local address — which is what it exists for.
+function isLoopback(req: express.Request): boolean {
+  const addr = req.socket.remoteAddress || "";
+  return (
+    addr === "127.0.0.1" ||
+    addr === "::1" ||
+    addr === "::ffff:127.0.0.1" ||
+    addr.startsWith("::ffff:127.")
+  );
+}
+
 function requireSecret(
   req: express.Request,
   res: express.Response,
   next: express.NextFunction,
 ): void {
   if (!workerSecret) return next();
+  if (isLoopback(req)) return next();
   if (req.get("x-operator-secret") === workerSecret) return next();
   res.status(401).json({ error: "Missing or invalid x-operator-secret" });
 }
