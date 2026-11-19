@@ -2724,7 +2724,14 @@ async function recordPage(opts: RecordOptions, id: string): Promise<RecordResult
   const aspectRatio = opts.aspectRatio || "9:16";
   const autoDuration = opts.autoDuration !== false;
 
-  const baseUrl = (getEnv("PUBLIC_BASE_URL") || "http://localhost:8080").replace(/\/$/, "");
+  const baseUrl = (
+    getEnv("PUBLIC_BASE_URL") ||
+    // Fall back to the port this worker actually listens on. A hardcoded
+    // localhost:8080 handed the bot a dead URL whenever the worker ran
+    // anywhere else, and the failure looked like a broken download, not a
+    // wrong port.
+    `http://127.0.0.1:${getEnv("PORT") || "8080"}`
+  ).replace(/\/$/, "");
 
   // One shared Chromium for the whole process (see getSharedBrowser) — a fresh
   // launch per render is what exhausted the container's process slots.
