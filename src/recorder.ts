@@ -40,8 +40,8 @@
  */
 import { spawn, spawnSync } from "child_process";
 import { mkdir, stat, unlink, readdir, writeFile, open, rename, rm } from "fs/promises";
-import { existsSync, readdirSync } from "fs";
-import { tmpdir } from "os";
+import { existsSync, readdirSync, mkdirSync, writeFileSync, renameSync, readFileSync, unlinkSync } from "fs";
+import { tmpdir, homedir } from "os";
 import { join } from "path";
 import { randomUUID } from "crypto";
 // === worker-only BEGIN: env readers (bot imports { getEnv, isEnvTrue } from "../env") ===
@@ -149,7 +149,7 @@ export interface JobRecord {
 
 // ΓöÇΓöÇ Constants ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
-const RECORDINGS_DIR = join(tmpdir(), "recordings");
+const RECORDINGS_DIR = process.env.RECORDINGS_DIR || join(tmpdir(), "recordings");
 
 export function recordingsDir(): string {
   return RECORDINGS_DIR;
@@ -360,6 +360,34 @@ const globalAny = globalThis as any;
 if (!globalAny.__RALPH_RECORD_JOBS__)
   globalAny.__RALPH_RECORD_JOBS__ = new Map<string, JobRecord>();
 const jobs: Map<string, JobRecord> = globalAny.__RALPH_RECORD_JOBS__;
+
+// Persistent state dir so a render-job registry survives a process restart:
+// the in-memory Map above dies with the process, but each record is mirrored
+// to a JSON file on disk and rehydrated lazily on a getJob() miss.
+const JOBS_DIR = process.env.RECORD_JOBS_DIR || join(homedir(), ".plunder-riffle", "jobs");
+
+function persistJob(job: JobRecord): void {
+  try {
+    mkdirSync(JOBS_DIR, { recursive: true });
+    const tmpPath = join(JOBS_DIR, `${job.id}.tmp`);
+    const finalPath = join(JOBS_DIR, `${job.id}.json`);
+    writeFileSync(tmpPath, JSON.stringify(job));
+    renameSync(tmpPath, finalPath);
+  } catch (err) {
+    console.warn(`[recorder] failed to persist job ${job.id}:`, (err as Error).message);
+  }
+}
+
+function loadPersistedJob(id: string): JobRecord | undefined {
+  const finalPath = join(JOBS_DIR, `${id}.json`);
+  try {
+    const job = JSON.parse(readFileSync(finalPath, "utf8")) as JobRecord;
+    jobs.set(id, job);
+    return job;
+  } catch {
+    return undefined;
+  }
+}
 
 // ΓöÇΓöÇ FFmpeg resolution ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 // DO NOT bundle ffmpeg-static ΓÇö the binary path breaks in production builds.
@@ -3189,6 +3217,7 @@ export async function runJob(opts: RecordOptions, runner: JobRunner): Promise<Jo
     startedAt: new Date().toISOString(),
   };
   jobs.set(id, job);
+  persistJob(job);
 
   // Fire-and-forget — callers poll via getJob()
   void (async () => {
@@ -3214,6 +3243,7 @@ export async function runJob(opts: RecordOptions, runner: JobRunner): Promise<Jo
     jCheck.status = "recording";
     jCheck.progress = 5;
     jCheck.message = "Launching browser...";
+    persistJob(jCheck);
     
     const totalDuration = opts.durationMs || 30000;
     const startTime = Date.now();
@@ -3224,6 +3254,7 @@ export async function runJob(opts: RecordOptions, runner: JobRunner): Promise<Jo
       if (j && j.status === "recording") {
         j.progress = pct;
         j.message = `RecordingΓÇª ${Math.floor(elapsed / 1000)}s elapsed`;
+        persistJob(j);
       }
     }, 500);
     if ((ticker as any).unref) (ticker as any).unref();
@@ -3262,6 +3293,7 @@ export async function runJob(opts: RecordOptions, runner: JobRunner): Promise<Jo
         j.message = "Done";
         j.finishedAt = new Date().toISOString();
         j.result = result;
+        persistJob(j);
       }
     } catch (err: any) {
       // `jobs.get(id)` is checked rather than asserted: the record can be gone
@@ -3274,6 +3306,7 @@ export async function runJob(opts: RecordOptions, runner: JobRunner): Promise<Jo
         j.message = (err as Error).message;
         j.error = (err as Error).message;
         j.finishedAt = new Date().toISOString();
+        persistJob(j);
       }
       console.error(`[recorder] job ${id} failed:`, (err as Error).message);
     } finally {
@@ -3300,7 +3333,9 @@ export async function runJob(opts: RecordOptions, runner: JobRunner): Promise<Jo
   return job;
 }
 
-export const getJob = (id: string): JobRecord | undefined => jobs.get(id);
+export function getJob(id: string): JobRecord | undefined {
+  return jobs.get(id) ?? loadPersistedJob(id);
+}
 export const listJobs = (): JobRecord[] =>
   Array.from(jobs.values()).sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1));
 
@@ -3348,6 +3383,11 @@ function sweepStaleJobs(): void {
       if (job.result?.thumbnailPath) {
         unlink(job.result.thumbnailPath).catch(() => {});
       }
+      try {
+        unlinkSync(join(JOBS_DIR, `${id}.json`));
+      } catch {
+        /* already gone ΓÇö fine */
+      }
       jobs.delete(id);
     }
   }
@@ -3384,6 +3424,11 @@ export async function deleteJob(id: string): Promise<void> {
     } catch {
       /* already gone ΓÇö fine */
     }
+  }
+  try {
+    unlinkSync(join(JOBS_DIR, `${id}.json`));
+  } catch {
+    /* already gone ΓÇö fine */
   }
   jobs.delete(id);
 }
