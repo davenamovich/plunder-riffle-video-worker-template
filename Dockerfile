@@ -46,12 +46,19 @@ RUN npm install
 
 COPY . .
 
-# Download the chromium revision pinned by the LOCAL playwright-core (1.62.1)
-# into $HOME/.cache/ms-playwright — exactly where recorderDiagnostics() looks
-# for it, and the revision launch() finds with no PLAYWRIGHT_CHROMIUM_PATH.
+# Download the chromium revision pinned by the LOCAL playwright-core (1.62.1).
 # `playwright-core` (not `playwright`) is the installed package, so the install
 # command must be `npx playwright-core install chromium`.
-RUN npx playwright-core install chromium
+#
+# PLAYWRIGHT_BROWSERS_PATH must point INSIDE the image. Left at its default
+# ($HOME/.cache/ms-playwright) the browsers land in the build container's home,
+# which the started container does not inherit — on Agent37 the first render then
+# dies on:
+#   browserType.launch: Executable doesn't exist at
+#   /root/.cache/ms-playwright/chromium_headless_shell-1234/...chrome-headless-shell
+# /app is the image's own WORKDIR, so this path survives into the container.
+ENV PLAYWRIGHT_BROWSERS_PATH=/app/.pw
+RUN npx playwright-core install chromium && ls -1 "$PLAYWRIGHT_BROWSERS_PATH"
 
 RUN npm run build
 
